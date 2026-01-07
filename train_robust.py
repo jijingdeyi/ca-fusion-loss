@@ -7,7 +7,7 @@ import time
 import logging
 import os
 from logger import setup_logger
-from loss import fusion_loss_adv
+from loss import fusion_loss
 import torch
 from torch.utils.data import DataLoader
 import warnings
@@ -29,7 +29,6 @@ def seed_everything(seed=3407):
 def attack(
     image_vis,
     image_ir,
-    image_gt,
     model,
     loss,
     step_size=1 / 255,
@@ -54,8 +53,8 @@ def attack(
         if adv_img_ir.grad is not None:
             adv_img_ir.grad = None
 
-        logits = model(adv_img_vis, adv_img_ir)
-        loss_total = loss(logits, image_gt)
+        fused = model(adv_img_vis, adv_img_ir)
+        loss_total = loss(adv_img_ir, adv_img_vis, fused)
         loss_total.backward()
 
         with torch.no_grad():
@@ -108,7 +107,7 @@ def train(logger):
         drop_last=True,
     )
 
-    train_loss = fusion_loss_adv()
+    train_loss = fusion_loss()
 
 
     epoch = 50
@@ -128,15 +127,11 @@ def train(logger):
             image_vis_ycrcb = RGB2YCrCb(image_vis)
             image_ir = Variable(image_ir).cuda()
 
-            image_gt = Variable(image_gt).cuda()
-            image_gt_ycbcr = RGB2YCrCb(image_gt)
-            image_gt_ycbcr = image_gt_ycbcr[:, : 1]
-
             logits = train_model(image_vis_ycrcb, image_ir)  # inputs
             
             # 生成对抗样本
             # image_vis_adv, image_ir_adv = attack_think2(image_vis, image_ir, logits, train_model, train_loss_adv)
-            image_vis_adv, image_ir_adv = attack(image_vis, image_ir, image_gt, train_model, train_loss)
+            image_vis_adv, image_ir_adv = attack(image_vis, image_ir, train_model, train_loss)
 
             logits_adv = train_model(image_vis_adv, image_ir_adv)
             
@@ -144,7 +139,7 @@ def train(logger):
             optimizer.zero_grad()
 
 
-            loss_total, loss_mse, loss_ssim = train_loss(logits, image_gt_ycbcr)
+            loss_total = train_loss(image)
             loss_total_adv, loss_mse_adv, loss_ssim_adv = train_loss(logits_adv, image_gt_ycbcr)
 
             loss = loss_total + loss_total_adv

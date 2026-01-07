@@ -45,11 +45,9 @@ class fusion_loss(nn.Module):
         fused_mean = fused.mean(dim=[2,3], keepdim=True)
         loss_mean = (fused_mean - vis_mean).abs().mean()
 
-
         tv_h = torch.abs(fused[:, :, 1:, :] - fused[:, :, :-1, :]).mean()
         tv_w = torch.abs(fused[:, :, :, 1:] - fused[:, :, :, :-1]).mean()
         loss_tv = tv_h + tv_w
-
 
         alpha = 1
         beta = 5
@@ -57,6 +55,7 @@ class fusion_loss(nn.Module):
         rho = 0.2
         delta = 0.001
         loss_fusion = alpha * loss_sal + beta * loss_grad + gamma * loss_ssim + rho * loss_mean + delta * loss_tv
+        
         return loss_fusion
 
 
