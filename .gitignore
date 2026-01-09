@@ -1,0 +1,52 @@
+# Logs
+logs/
+*.log
+
+# Supplementary materials
+supp/
+
+# Test images
+test_images/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Model checkpoints (usually large files)
+*.pth
+*.pkl
+*.ckpt
+*.h5
+*.hdf5
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Results
+results/
+outputs/
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+

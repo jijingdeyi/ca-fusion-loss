@@ -56,6 +56,15 @@ class fusion_loss(nn.Module):
         delta = 0.001
         loss_fusion = alpha * loss_sal + beta * loss_grad + gamma * loss_ssim + rho * loss_mean + delta * loss_tv
         
-        return loss_fusion
+        loss_dict = {
+            'loss_sal': loss_sal.item(),
+            'loss_grad': loss_grad.item(),
+            'loss_ssim': loss_ssim.item(),
+            'loss_mean': loss_mean.item(),
+            'loss_tv': loss_tv.item()
+        }
+        
+        return loss_fusion, loss_dict
+
 
 

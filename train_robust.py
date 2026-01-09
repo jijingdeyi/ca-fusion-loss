@@ -1,7 +1,6 @@
-from torch.autograd import Variable
 from model import ESSA_UNet
 
-from dataset import fusion_dataset_gt
+from dataset import trainloader
 import datetime
 import time
 import logging
@@ -9,7 +8,6 @@ import os
 from logger import setup_logger
 from loss import fusion_loss
 import torch
-from torch.utils.data import DataLoader
 import warnings
 from rgb2ycbcr import RGB2YCrCb
 import random
@@ -91,65 +89,60 @@ def train(logger):
 
     optimizer = torch.optim.Adam(train_model.parameters(), lr=lr_start)
 
-    ir_path = '/home/lijiawei/local/dataset/train/ir/'
-    vis_path = '/home/lijiawei/local/dataset/train/vis/'
-    gt_path = '/home/lijiawei/local/dataset/train/gt/'
-
-
-    train_dataset = fusion_dataset_gt(ir_path=ir_path, vis_path=vis_path, gt_path=gt_path)
-    logger.info("The length of training dataset:{}".format(train_dataset.length))
-    train_loader = DataLoader(
-        dataset=train_dataset,
-        batch_size=4,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True,
-        drop_last=True,
-    )
-
     train_loss = fusion_loss()
-
-
+    train_loss.to(device)  # 将损失函数也移到 GPU
     epoch = 50
 
     st = glob_st = time.time()
     logger.info('Train start!')
 
-    for epo in range(0, epoch):
+    for epo in range(epoch):
         lr_start = 0.001
         lr_decay = 0.75
         lr_epo = lr_start * lr_decay ** (epo - 1)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr_epo
-        for it, (image_vis, image_ir, image_gt, name) in enumerate(train_loader):
+        for it, (image_ir, image_vis) in enumerate(trainloader):
+            
             train_model.train()
-            image_vis = Variable(image_vis).cuda()
+
+            image_vis = image_vis.to(device)
+            image_ir = image_ir.to(device)
             image_vis_ycrcb = RGB2YCrCb(image_vis)
-            image_ir = Variable(image_ir).cuda()
 
             logits = train_model(image_vis_ycrcb, image_ir)  # inputs
             
             # 生成对抗样本
-            # image_vis_adv, image_ir_adv = attack_think2(image_vis, image_ir, logits, train_model, train_loss_adv)
-            image_vis_adv, image_ir_adv = attack(image_vis, image_ir, train_model, train_loss)
+            # image_vis_adv, image_ir_adv = attack(image_vis, image_ir, train_model, train_loss)
 
-            logits_adv = train_model(image_vis_adv, image_ir_adv)
+            # logits_adv = train_model(image_vis_adv, image_ir_adv)
             
 
             optimizer.zero_grad()
 
 
-            loss_total = train_loss(image)
-            loss_total_adv, loss_mse_adv, loss_ssim_adv = train_loss(logits_adv, image_gt_ycbcr)
+            loss_total, loss_dict = train_loss(image_ir, image_vis_ycrcb[:, 0:1, :, :], logits)
+            # loss_total_adv, loss_mse_adv, loss_ssim_adv = train_loss(logits_adv, image_gt_ycbcr)
 
-            loss = loss_total + loss_total_adv
+            # loss = loss_total + loss_total_adv
+            loss = loss_total
+            
+            # 检查损失是否为 NaN 或 Inf
+            if torch.isnan(loss) or torch.isinf(loss):
+                logger.warning(f"Loss is NaN or Inf at epoch {epo}, iter {it}, skipping...")
+                continue
+            
             loss.backward()
+            
+            # 梯度裁剪，防止梯度爆炸
+            torch.nn.utils.clip_grad_norm_(train_model.parameters(), max_norm=1.0)
+            
             optimizer.step()
 
             ed = time.time()
             t_intv, glob_t_intv = ed - st, ed - glob_st
-            now_it = len(train_loader) * epo + it + 1
-            eta = int((len(train_loader) * epoch - now_it)
+            now_it = len(trainloader) * epo + it + 1
+            eta = int((len(trainloader) * epoch - now_it)
                       * (glob_t_intv / (now_it)))
             eta = str(datetime.timedelta(seconds=eta))
             if now_it % 10 == 0:
@@ -157,30 +150,33 @@ def train(logger):
                     [
                         'step: {it}/{max_it}',
                         'loss: {loss:.4f}',
-                        'loss_total: {loss_total:.4f}',
-                        'loss_mse: {loss_mse:.4f}',
+                        # 'loss_total: {loss_total:.4f}',
+                        'loss_sal: {loss_sal:.4f}',
+                        'loss_grad: {loss_grad:.4f}',
                         'loss_ssim: {loss_ssim:.4f}',
+                        'loss_mean: {loss_mean:.4f}',
+                        'loss_tv: {loss_tv:.4f}',
 
                         # 对抗loss
-                        'loss_total_adv: {loss_total_adv:.4f}',
-                        'loss_mse_adv: {loss_mse_adv:.4f}',
-                        'loss_ssim_adv: {loss_ssim_adv:.4f}',
+                        # 'loss_total_adv: {loss_total_adv:.4f}',
 
                         'eta: {eta}',
                         'time: {time:.4f}',
                     ]
                 ).format(
                         it=now_it,
-                        max_it=len(train_loader) * epoch,
+                        max_it=len(trainloader) * epoch,
                         loss=loss.item(),
-                        loss_total=loss_total.item(),
-                        loss_mse=loss_mse.item(),
-                        loss_ssim=loss_ssim.item(),
-
+                        # loss_total=loss_total.item(),
+                        loss_sal=loss_dict['loss_sal'],
+                        loss_grad=loss_dict['loss_grad'],
+                        loss_ssim=loss_dict['loss_ssim'],
+                        loss_mean=loss_dict['loss_mean'],
+                        loss_tv=loss_dict['loss_tv'],
                         # 对抗loss
-                        loss_total_adv=loss_total_adv.item(),
-                        loss_mse_adv=loss_mse_adv.item(),
-                        loss_ssim_adv=loss_ssim_adv.item(),
+                        # loss_total_adv=loss_total_adv.item(),
+                        # loss_mse_adv=loss_mse_adv.item(),
+                        # loss_ssim_adv=loss_ssim_adv.item(),
 
                         time=t_intv,
                         eta=eta,
@@ -189,7 +185,7 @@ def train(logger):
                 st = ed
 
 
-    train_model_file = os.path.join(model_path, 'rebuttal_13.pth')
+    train_model_file = os.path.join(model_path, f'{loss_total.item()}.pth')
     torch.save(train_model.state_dict(), train_model_file)
     logger.info("Train model save as: {}".format(train_model_file))
     logger.info('\n')
@@ -203,7 +199,7 @@ if __name__ == "__main__":
     logger = logging.getLogger()
     setup_logger(logpath)
     train(logger)
-    print("Train finish!")
+    logger.info("Train finish!")
 
 
 
