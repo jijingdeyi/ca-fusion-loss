@@ -160,8 +160,8 @@ def train(logger):
                         # 对抗loss
                         # 'loss_total_adv: {loss_total_adv:.4f}',
 
-                        'eta: {eta}',
                         'time: {time:.4f}',
+                        'eta: {eta}',
                     ]
                 ).format(
                         it=now_it,
