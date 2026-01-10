@@ -77,7 +77,7 @@ def attack(
 
 
 
-def train(logger):
+def train(logger, exp_name=None):
 
     lr_start = 0.001
     model_path = './model'
@@ -99,7 +99,15 @@ def train(logger):
     val_best_score = 0.0
     patience_max = 5
     patience = 0
-    logger.info('Train start!')
+    
+    # 生成实验ID（用于区分不同实验）
+    if exp_name is None:
+        exp_id = time.strftime("%Y%m%d-%H%M%S")
+    else:
+        exp_id = f"{exp_name}-{time.strftime('%Y%m%d-%H%M%S')}"
+    best_model_name = f'A2RNet-{exp_id}-best.pth'
+    best_model_path = os.path.join(model_path, best_model_name)
+    logger.info(f'Train start! Experiment: {exp_id}')
 
     for epo in range(epoch):
         lr_start = 0.001
@@ -222,13 +230,13 @@ def train(logger):
 
         logger.info(f"Epoch {epo}: val_qabf={avg_qabf:.4f}, val_vif={avg_vif:.4f}, val_score={val_score:.4f}")
 
-        # 判断是否保存模型和早停
+
         if val_score > val_best_score:
+            old_score = val_best_score
             val_best_score = val_score
-            model_name = f'A2RNet-{time.strftime("%Y-%m-%d-%H-%M-%S")}-{val_best_score:.4f}.pth'
-            train_model_file = os.path.join(model_path, model_name)
-            torch.save(train_model.state_dict(), train_model_file)
-            logger.info("Val model save as: {}, val_score: {:.4f}".format(model_name, val_best_score))
+            torch.save(train_model.state_dict(), best_model_path)
+            logger.info("Best model updated: {} (score: {:.4f} -> {:.4f})".format(
+                best_model_name, old_score, val_best_score))
             patience = 0
         else:
             patience += 1
