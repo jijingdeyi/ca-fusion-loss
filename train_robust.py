@@ -130,7 +130,7 @@ def train(logger, exp_name=None):
             image_ir = image_ir.to(device)
             image_vis_ycrcb = RGB2YCrCb(image_vis)
 
-            logits = train_model(image_vis_ycrcb, image_ir)  # inputs
+            logits = train_model(image_vis_ycrcb, image_ir)
             
             # 生成对抗样本
             # image_vis_adv, image_ir_adv = attack(image_vis, image_ir, train_model, train_loss)

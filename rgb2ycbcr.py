@@ -12,7 +12,7 @@ def RGB2YCrCb(input_im):
     Y = torch.unsqueeze(Y, 1)
     Cr = torch.unsqueeze(Cr, 1)
     Cb = torch.unsqueeze(Cb, 1)
-    temp = torch.cat((Y, Cr, Cb), dim=1).cuda() # (nhw, 3)
+    temp = torch.cat((Y, Cr, Cb), dim=1).to(input_im.device) # (nhw, 3)
     out = (
         temp.reshape(
             list(input_im.size())[0],

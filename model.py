@@ -133,24 +133,10 @@ class ESSAttn(nn.Module):
         k2 = torch.pow(k, 2)
         k2s = torch.sum(k2, dim=2, keepdim=True)
         t1 = v
-        k2 = F.normalize((k2 / (k2s + 1e-7)), dim=-2)
-        q2 = F.normalize((q2 / (q2s + 1e-7)), dim=-1)
+        k2 = k2 / (k2s + 1e-7)
+        q2 = q2 / (q2s + 1e-7)
         t2 = q2 @ (k2.transpose(-2, -1) @ v) / math.sqrt(N)
-        # t2 = self.norm1(t2)*0.3
-        # print(torch.mean(t1),torch.std(t1))
-        # print(torch.mean(t2), torch.std(t2))
-        # t2 = self.norm1(t2)*0.1
-        # t2 = ((q2 / (q2s+1e-7)) @ t2)
 
-        # q3 = torch.pow(q,4)
-        # q3s = torch.pow(q2s,2)
-        # k3 = torch.pow(k, 4)
-        # k3s = torch.sum(k2,dim=2).unsqueeze(2).repeat(1, 1, C)
-        # t3 = ((k3 / k3s)*16).transpose(-2, -1) @ v
-        # t3 = ((q3 / q3s)*16) @ t3
-        # print(torch.max(t1))
-        # print(torch.max(t2))
-        # t3 = (((torch.pow(q,4))/24) @ (((torch.pow(k,4).transpose(-2,-1))/24)@v)*16/math.sqrt(N))
         attn = t1 + t2
         attn = self.ln(attn)
         return attn
