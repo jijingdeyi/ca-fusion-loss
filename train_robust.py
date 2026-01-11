@@ -91,8 +91,12 @@ def train(logger, exp_name=None):
 
     optimizer = torch.optim.Adam(train_model.parameters(), lr=lr_start)
 
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.75, patience=2, min_lr=1e-6
+    )
+
     train_loss = fusion_loss()
-    train_loss.to(device)  # 将损失函数也移到 GPU
+    train_loss.to(device)  
     epoch = 50
 
     st = glob_st = time.time()
@@ -110,13 +114,8 @@ def train(logger, exp_name=None):
     logger.info(f'Train start! Experiment: {exp_id}')
 
     for epo in range(epoch):
-        lr_start = 0.001
-        lr_decay = 0.75
-        lr_epo = lr_start * lr_decay ** (epo - 1)
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr_epo
+        current_lr = optimizer.param_groups[0]['lr']
         
-        # 用于累积每个epoch的训练loss
         epoch_losses = []
         epoch_loss_dict = {
             'loss_sal': [], 'loss_grad': [], 'loss_ssim': [],
@@ -187,7 +186,8 @@ def train(logger, exp_name=None):
                    f"grad: {avg_loss_dict['loss_grad']:.4f}, "
                    f"ssim: {avg_loss_dict['loss_ssim']:.4f}, "
                    f"mean: {avg_loss_dict['loss_mean']:.4f}, "
-                   f"tv: {avg_loss_dict['loss_tv']:.4f})")
+                   f"tv: {avg_loss_dict['loss_tv']:.4f}), "
+                   f"LR: {current_lr:.6f}")
 
         # 验证阶段
         train_model.eval()
@@ -222,6 +222,8 @@ def train(logger, exp_name=None):
 
         logger.info(f"Epoch {epo}: val_qabf={avg_qabf:.4f}, val_vif={avg_vif:.4f}, val_score={val_score:.4f}")
 
+        # 根据验证指标更新学习率
+        scheduler.step(val_score)
 
         if val_score > val_best_score:
             old_score = val_best_score
