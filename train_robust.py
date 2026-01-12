@@ -13,6 +13,8 @@ from rgb2ycbcr import RGB2YCrCb
 import random
 
 from metric import VIF_function, Qabf_function
+from model_init import init_weights
+
 
 import numpy as np
 warnings.filterwarnings('ignore')
@@ -87,6 +89,7 @@ def train(logger, exp_name=None):
     
     train_model = ESSA_UNet()
     train_model.to(device)
+    init_weights(train_model)
     train_model.train()
 
     optimizer = torch.optim.Adam(train_model.parameters(), lr=lr_start)
