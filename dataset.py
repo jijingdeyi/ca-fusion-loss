@@ -68,7 +68,7 @@ train_transform = A.Compose(
     [
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.5),
-        A.RandomCrop(height=256, width=256),
+        A.RandomCrop(height=480, width=480),
         ToTensorV2(),  # 同时作用到 image 和 additional_targets
     ],
     additional_targets={

@@ -1,4 +1,4 @@
-from model import ESSA_UNet
+from Ufuser import Ufuser
 
 from dataset import trainloader, valloader
 import datetime
@@ -13,7 +13,6 @@ from rgb2ycbcr import RGB2YCrCb
 import random
 
 from metric import VIF_function, Qabf_function
-from model_init import init_weights
 
 
 import numpy as np
@@ -87,9 +86,9 @@ def train(logger, exp_name=None):
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    train_model = ESSA_UNet()
+    train_model = Ufuser()
     train_model.to(device)
-    init_weights(train_model)
+    # init_weights(train_model)
     train_model.train()
 
     optimizer = torch.optim.Adam(train_model.parameters(), lr=lr_start)
@@ -122,7 +121,7 @@ def train(logger, exp_name=None):
         epoch_losses = []
         epoch_loss_dict = {
             'loss_sal': [], 'loss_grad': [], 'loss_ssim': [],
-            'loss_mean': [], 'loss_tv': []
+            'loss_mean': []
         }
         
         for it, (image_ir, image_vis) in enumerate(trainloader):
@@ -133,7 +132,7 @@ def train(logger, exp_name=None):
             image_ir = image_ir.to(device)
             image_vis_ycrcb = RGB2YCrCb(image_vis)
 
-            logits = train_model(image_vis_ycrcb, image_ir)
+            logits = train_model(image_vis_ycrcb[:, 0:1, :, :], image_ir)
             
             # 生成对抗样本
             # image_vis_adv, image_ir_adv = attack(image_vis, image_ir, train_model, train_loss)
@@ -189,7 +188,6 @@ def train(logger, exp_name=None):
                    f"grad: {avg_loss_dict['loss_grad']:.4f}, "
                    f"ssim: {avg_loss_dict['loss_ssim']:.4f}, "
                    f"mean: {avg_loss_dict['loss_mean']:.4f}, "
-                   f"tv: {avg_loss_dict['loss_tv']:.4f}), "
                    f"LR: {current_lr:.6f}")
 
         # 验证阶段
@@ -205,7 +203,7 @@ def train(logger, exp_name=None):
                 image_vis_ycrcb = RGB2YCrCb(image_vis)
                 image_vis_y = image_vis_ycrcb[:, 0:1, :, :]
 
-                fused = train_model(image_vis_ycrcb, image_ir)
+                fused = train_model(image_vis_y, image_ir)
                 
                 image_ir_np = (image_ir.squeeze().cpu().numpy() * 255.0).astype(np.float32)
                 image_vis_y_np = (image_vis_y.squeeze().cpu().numpy() * 255.0).astype(np.float32)

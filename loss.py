@@ -45,23 +45,18 @@ class fusion_loss(nn.Module):
         fused_mean = fused.mean(dim=[2,3], keepdim=True)
         loss_mean = (fused_mean - vis_mean).abs().mean()
 
-        tv_h = torch.abs(fused[:, :, 1:, :] - fused[:, :, :-1, :]).mean()
-        tv_w = torch.abs(fused[:, :, :, 1:] - fused[:, :, :, :-1]).mean()
-        loss_tv = tv_h + tv_w
-
         alpha = 1
         beta = 5
         gamma = 1
         rho = 0.2
-        delta = 0.001
-        loss_fusion = alpha * loss_sal + beta * loss_grad + gamma * loss_ssim + rho * loss_mean + delta * loss_tv
+
+        loss_fusion = alpha * loss_sal + beta * loss_grad + gamma * loss_ssim + rho * loss_mean
         
         loss_dict = {
             'loss_sal': loss_sal.item(),
             'loss_grad': loss_grad.item(),
             'loss_ssim': loss_ssim.item(),
             'loss_mean': loss_mean.item(),
-            'loss_tv': loss_tv.item()
         }
         
         return loss_fusion, loss_dict
