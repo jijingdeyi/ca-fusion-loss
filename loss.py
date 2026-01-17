@@ -34,6 +34,7 @@ class fusion_loss(nn.Module):
         fused_grad = self.sobelconv(fused)
         loss_grad = F.l1_loss(y_grad, fused_grad)
 
+        fused_clamped = fused.clamp(0, 1)
         loss_ssim = 1 - ssim(fused, vis, data_range=1.0, size_average=True)
 
         k = 2 #temperature parameter
@@ -45,18 +46,28 @@ class fusion_loss(nn.Module):
         fused_mean = fused.mean(dim=[2,3], keepdim=True)
         loss_mean = (fused_mean - vis_mean).abs().mean()
 
+        loss_range = ((fused - fused_clamped) ** 2).mean()
+
         alpha = 1
         beta = 5
         gamma = 1
         rho = 0.2
+        delta = 0.1
 
-        loss_fusion = alpha * loss_sal + beta * loss_grad + gamma * loss_ssim + rho * loss_mean
+        loss_fusion = (
+            alpha * loss_sal
+            + beta * loss_grad
+            + gamma * loss_ssim
+            + rho * loss_mean
+            + delta * loss_range
+        )
         
         loss_dict = {
             'loss_sal': loss_sal.item(),
             'loss_grad': loss_grad.item(),
             'loss_ssim': loss_ssim.item(),
             'loss_mean': loss_mean.item(),
+            'loss_range': loss_range.item(),
         }
         
         return loss_fusion, loss_dict

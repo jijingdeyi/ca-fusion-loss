@@ -173,7 +173,7 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
             epoch_losses = []
             epoch_loss_dict = {
                 'loss_sal': [], 'loss_grad': [], 'loss_ssim': [],
-                'loss_mean': []
+                'loss_mean': [], 'loss_range': []
             }
             
             for it, (image_ir, image_vis) in enumerate(trainloader):
@@ -254,17 +254,19 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
             avg_loss_dict = {key: sum(vals) / len(vals) if vals else 0.0 
                             for key, vals in epoch_loss_dict.items()}
             logger.info(f"Epoch {epo+1}/{epoch} - Train Loss: {avg_epoch_loss:.4f} "
-                       f"(sal: {avg_loss_dict['loss_sal']:.4f}, "
-                       f"grad: {avg_loss_dict['loss_grad']:.4f}, "
-                       f"ssim: {avg_loss_dict['loss_ssim']:.4f}, "
-                       f"mean: {avg_loss_dict['loss_mean']:.4f}, "
-                       f"LR: {current_lr:.6f}")
+                        f"(sal: {avg_loss_dict['loss_sal']:.4f}, "
+                        f"grad: {avg_loss_dict['loss_grad']:.4f}, "
+                        f"ssim: {avg_loss_dict['loss_ssim']:.4f}, "
+                        f"mean: {avg_loss_dict['loss_mean']:.4f}, "
+                        f"range: {avg_loss_dict['loss_range']:.4f}, "
+                        f"LR: {current_lr:.6f}")
 
             writer.add_scalar('train/loss', avg_epoch_loss, epo + 1)
             writer.add_scalar('train/loss_sal', avg_loss_dict['loss_sal'], epo + 1)
             writer.add_scalar('train/loss_grad', avg_loss_dict['loss_grad'], epo + 1)
             writer.add_scalar('train/loss_ssim', avg_loss_dict['loss_ssim'], epo + 1)
             writer.add_scalar('train/loss_mean', avg_loss_dict['loss_mean'], epo + 1)
+            writer.add_scalar('train/loss_range', avg_loss_dict['loss_range'], epo + 1)
             writer.add_scalar('train/lr', current_lr, epo + 1)
             writer.add_scalar('train/grad_norm', float(grad_norm), epo + 1)
 
@@ -282,10 +284,11 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
                     image_vis_y = image_vis_ycrcb[:, 0:1, :, :]
 
                     fused = train_model(image_vis_y, image_ir)
+                    fused_clamped = fused.clamp(0, 1)
 
                     if tb_image_every > 0 and (epo % tb_image_every == 0) and it < 3:
                         # 生成RGB融合图像
-                        preview = make_preview_tensor(image_vis, image_ir, fused, image_vis_ycrcb)
+                        preview = make_preview_tensor(image_vis, image_ir, fused_clamped, image_vis_ycrcb)
                         writer.add_image(f'val/preview_{it}', preview, epo + 1)
                         
                         if it == 0:
@@ -295,7 +298,7 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
                     
                     image_ir_np = (image_ir.squeeze().cpu().numpy() * 255.0).astype(np.float32)
                     image_vis_y_np = (image_vis_y.squeeze().cpu().numpy() * 255.0).astype(np.float32)
-                    fused_np = (fused.squeeze().cpu().numpy() * 255.0).astype(np.float32)
+                    fused_np = (fused_clamped.squeeze().cpu().numpy() * 255.0).astype(np.float32)
                     
                     qabf = Qabf_function(image_ir_np, image_vis_y_np, fused_np)
                     vif = VIF_function(image_ir_np, image_vis_y_np, fused_np)

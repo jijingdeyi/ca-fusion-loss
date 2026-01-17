@@ -343,16 +343,13 @@ class Ufuser(nn.Module):
         self.de_3 = Restormer_CNN_block(channel[2] * 2, channel[2])
         self.de_4 = Restormer_CNN_block(channel[3], channel[3])
 
-        self.last = nn.Sequential(
-            nn.Conv2d(
-                channel[0],
-                1,
-                kernel_size=3,
-                stride=1,
-                padding=1,
-                padding_mode="reflect",
-            ),
-            nn.Sigmoid(),
+        self.last = nn.Conv2d(
+            channel[0],
+            1,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            padding_mode="reflect",
         )
 
     def forward(self, i, v):
