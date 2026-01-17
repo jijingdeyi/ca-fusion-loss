@@ -26,12 +26,13 @@ def RGB2YCrCb(input_im):
     return out # (n, 3, h, w)
 
 def YCrCb2RGB(input_im):
+    device = input_im.device
     im_flat = input_im.transpose(1, 3).transpose(1, 2).reshape(-1, 3)
     mat = torch.tensor(
         [[1.0, 1.0, 1.0], [1.403, -0.714, 0.0], [0.0, -0.344, 1.773]]
-    ).cuda()
-    bias = torch.tensor([0.0 / 255, -0.5, -0.5]).cuda()
-    temp = (im_flat + bias).mm(mat).cuda()
+    ).to(device)
+    bias = torch.tensor([0.0 / 255, -0.5, -0.5]).to(device)
+    temp = (im_flat + bias).mm(mat)
     out = (
         temp.reshape(
             list(input_im.size())[0],

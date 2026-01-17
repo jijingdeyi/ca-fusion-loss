@@ -10,22 +10,35 @@ from loss import fusion_loss
 import torch
 from torch.utils.tensorboard import SummaryWriter
 import warnings
-from rgb2ycbcr import RGB2YCrCb
+from rgb2ycbcr import RGB2YCrCb, YCrCb2RGB
 import random
 
 from metric import VIF_function, Qabf_function
 
 
 import numpy as np
+
 warnings.filterwarnings('ignore')
 
 def seed_everything(seed=3407):
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+    random.seed(seed)
+    np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
-    random.seed(seed)
     torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
+
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 def attack(
@@ -79,18 +92,39 @@ def attack(
 
 
 
-def make_preview_tensor(image_vis, image_ir, fused):
+def make_preview_tensor(image_vis, image_ir, fused_y, image_vis_ycrcb=None):
+    """
+    Create preview tensor with RGB images: [VIS | IR | FUSED_RGB]
+    
+    Args:
+        image_vis: RGB visible image [B, 3, H, W]
+        image_ir: IR image [B, 1, H, W]
+        fused_y: Fused Y channel [B, 1, H, W]
+        image_vis_ycrcb: Optional YCrCb visible image [B, 3, H, W]
+    """
     vis = image_vis[0].detach().cpu().clamp(0, 1)
     ir = image_ir[0].detach().cpu().clamp(0, 1)
-    fused_img = fused[0].detach().cpu().clamp(0, 1)
-
+    
+    # Convert IR to RGB for display
     if ir.shape[0] == 1:
         ir = ir.repeat(3, 1, 1)
-    if fused_img.shape[0] == 1:
-        fused_img = fused_img.repeat(3, 1, 1)
+    
+    # Convert fused Y to RGB using original CrCb channels
+    if image_vis_ycrcb is not None:
+        fused_ycrcb = torch.cat([
+            fused_y[0:1].detach().cpu().clamp(0, 1),
+            image_vis_ycrcb[0:1, 1:2].detach().cpu(),  # Cr
+            image_vis_ycrcb[0:1, 2:3].detach().cpu()   # Cb
+        ], dim=1)  # 在通道维度拼接: [1, 3, H, W]
+        fused_rgb = YCrCb2RGB(fused_ycrcb).squeeze(0).clamp(0, 1)
+    else:
+        # Fallback: convert grayscale to RGB
+        fused_rgb = fused_y[0].detach().cpu().clamp(0, 1)
+        if fused_rgb.shape[0] == 1:
+            fused_rgb = fused_rgb.repeat(3, 1, 1)
 
-    # Concatenate along width: [VIS | IR | FUSED]
-    preview = torch.cat([vis, ir, fused_img], dim=2)
+    # Concatenate along width: [VIS | IR | FUSED_RGB]
+    preview = torch.cat([vis, ir, fused_rgb], dim=2)
     return preview
 
 
@@ -151,6 +185,24 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
                 image_vis_ycrcb = RGB2YCrCb(image_vis)
 
                 logits = train_model(image_vis_ycrcb[:, 0:1, :, :], image_ir)
+
+                if it == 0:
+                    with torch.no_grad():
+                        fused_min = logits.min().item()
+                        fused_max = logits.max().item()
+                        fused_mean = logits.mean().item()
+                        ir_mean = image_ir.mean().item()
+                        vis_mean = image_vis_ycrcb[:, 0:1, :, :].mean().item()
+                    writer.add_scalar('train/fused_min', fused_min, epo + 1)
+                    writer.add_scalar('train/fused_max', fused_max, epo + 1)
+                    writer.add_scalar('train/fused_mean', fused_mean, epo + 1)
+                    writer.add_scalar('train/ir_mean', ir_mean, epo + 1)
+                    writer.add_scalar('train/vis_mean', vis_mean, epo + 1)
+                    if fused_max < 1e-3:
+                        logger.warning(
+                            f"Epoch {epo+1}: fused output near zero (min={fused_min:.4g}, "
+                            f"max={fused_max:.4g}, mean={fused_mean:.4g})"
+                        )
                 
                 # 生成对抗样本
                 # image_vis_adv, image_ir_adv = attack(image_vis, image_ir, train_model, train_loss)
@@ -180,7 +232,7 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
                 loss.backward()
                 
                 # 梯度裁剪，防止梯度爆炸
-                torch.nn.utils.clip_grad_norm_(train_model.parameters(), max_norm=1.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(train_model.parameters(), max_norm=1.0)
                 
                 optimizer.step()
                 
@@ -214,6 +266,7 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
             writer.add_scalar('train/loss_ssim', avg_loss_dict['loss_ssim'], epo + 1)
             writer.add_scalar('train/loss_mean', avg_loss_dict['loss_mean'], epo + 1)
             writer.add_scalar('train/lr', current_lr, epo + 1)
+            writer.add_scalar('train/grad_norm', float(grad_norm), epo + 1)
 
             # 验证阶段
             train_model.eval()
@@ -230,9 +283,15 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
 
                     fused = train_model(image_vis_y, image_ir)
 
-                    if tb_image_every > 0 and (epo % tb_image_every == 0) and it == 0:
-                        preview = make_preview_tensor(image_vis, image_ir, fused)
-                        writer.add_image('val/preview', preview, epo + 1)
+                    if tb_image_every > 0 and (epo % tb_image_every == 0) and it < 3:
+                        # 生成RGB融合图像
+                        preview = make_preview_tensor(image_vis, image_ir, fused, image_vis_ycrcb)
+                        writer.add_image(f'val/preview_{it}', preview, epo + 1)
+                        
+                        if it == 0:
+                            writer.add_scalar('val/fused_min', fused.min().item(), epo + 1)
+                            writer.add_scalar('val/fused_max', fused.max().item(), epo + 1)
+                            writer.add_scalar('val/fused_mean', fused.mean().item(), epo + 1)
                     
                     image_ir_np = (image_ir.squeeze().cpu().numpy() * 255.0).astype(np.float32)
                     image_vis_y_np = (image_vis_y.squeeze().cpu().numpy() * 255.0).astype(np.float32)
