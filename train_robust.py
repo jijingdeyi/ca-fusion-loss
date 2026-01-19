@@ -172,8 +172,8 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
             
             epoch_losses = []
             epoch_loss_dict = {
-                'loss_sal': [], 'loss_grad': [], 'loss_ssim': [],
-                'loss_mean': [], 'loss_range': []
+                'loss_base': [], 'loss_detail': [], 'loss_grad': [], 
+                'loss_ssim': [], 'loss_bloom': []
             }
             
             for it, (image_ir, image_vis) in enumerate(trainloader):
@@ -254,19 +254,19 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
             avg_loss_dict = {key: sum(vals) / len(vals) if vals else 0.0 
                             for key, vals in epoch_loss_dict.items()}
             logger.info(f"Epoch {epo+1}/{epoch} - Train Loss: {avg_epoch_loss:.4f} "
-                        f"(sal: {avg_loss_dict['loss_sal']:.4f}, "
+                        f"(base: {avg_loss_dict['loss_base']:.4f}, "
+                        f"detail: {avg_loss_dict['loss_detail']:.4f}, "
                         f"grad: {avg_loss_dict['loss_grad']:.4f}, "
                         f"ssim: {avg_loss_dict['loss_ssim']:.4f}, "
-                        f"mean: {avg_loss_dict['loss_mean']:.4f}, "
-                        f"range: {avg_loss_dict['loss_range']:.4f}, "
+                        f"bloom: {avg_loss_dict['loss_bloom']:.4f}, "
                         f"LR: {current_lr:.6f}")
 
             writer.add_scalar('train/loss', avg_epoch_loss, epo + 1)
-            writer.add_scalar('train/loss_sal', avg_loss_dict['loss_sal'], epo + 1)
+            writer.add_scalar('train/loss_base', avg_loss_dict['loss_base'], epo + 1)
+            writer.add_scalar('train/loss_detail', avg_loss_dict['loss_detail'], epo + 1)
             writer.add_scalar('train/loss_grad', avg_loss_dict['loss_grad'], epo + 1)
             writer.add_scalar('train/loss_ssim', avg_loss_dict['loss_ssim'], epo + 1)
-            writer.add_scalar('train/loss_mean', avg_loss_dict['loss_mean'], epo + 1)
-            writer.add_scalar('train/loss_range', avg_loss_dict['loss_range'], epo + 1)
+            writer.add_scalar('train/loss_bloom', avg_loss_dict['loss_bloom'], epo + 1)
             writer.add_scalar('train/lr', current_lr, epo + 1)
             writer.add_scalar('train/grad_norm', float(grad_norm), epo + 1)
 
