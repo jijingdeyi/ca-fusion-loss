@@ -142,10 +142,6 @@ class SoftGradlossAligned(nn.Module):
         )
 
     def forward(self, vis, ir, fused):
-        """
-        vis, ir, fused: (B,1,H,W)
-        fused: RAW output (no clamp)
-        """
         loss = 0.0
         w_scale = 1.0 / len(self.scales)
 
@@ -158,18 +154,18 @@ class SoftGradlossAligned(nn.Module):
             gix, giy = self.sobel(ir_s)
             gfx, gfy = self.sobel(fused_s)
 
-            # Compute gradient magnitude (L1 norm: |gx| + |gy|)
+            # magnitude for gating only (no direction lost in supervision)
             gv = torch.abs(gvx) + torch.abs(gvy)
             gi = torch.abs(gix) + torch.abs(giy)
-            gf = torch.abs(gfx) + torch.abs(gfy)
 
-            # soft selection weight
             w = torch.sigmoid(self.slope * (gi - gv))
 
-            # softly aligned target gradient
-            target = w * gi + (1.0 - w) * gv
+            # direction-aligned soft target (component-wise, sign-preserving)
+            tx = w * gix + (1.0 - w) * gvx
+            ty = w * giy + (1.0 - w) * gvy
 
-            loss = loss + w_scale * F.l1_loss(gf, target)
+            loss_s = F.l1_loss(gfx, tx) + F.l1_loss(gfy, ty)
+            loss = loss + w_scale * loss_s
 
         return loss
 
