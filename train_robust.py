@@ -173,7 +173,8 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
             epoch_losses = []
             epoch_loss_dict = {
                 'loss_base': [], 'loss_detail': [], 'loss_grad': [], 
-                'loss_ssim': [], 'loss_bloom': []
+                'loss_ssim': [], 'loss_bloom': [], 'loss_halo': [],
+                'm_mean': [], 'mhalo_mean': [], 'mbase_mean': []
             }
             
             for it, (image_ir, image_vis) in enumerate(trainloader):
@@ -259,6 +260,10 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
                         f"grad: {avg_loss_dict['loss_grad']:.4f}, "
                         f"ssim: {avg_loss_dict['loss_ssim']:.4f}, "
                         f"bloom: {avg_loss_dict['loss_bloom']:.4f}, "
+                        f"halo: {avg_loss_dict['loss_halo']:.4f}, "
+                        f"M: {avg_loss_dict['m_mean']:.4f}, "
+                        f"Mhalo: {avg_loss_dict['mhalo_mean']:.4f}, "
+                        f"Mbase: {avg_loss_dict['mbase_mean']:.4f}, "
                         f"LR: {current_lr:.6f}")
 
             writer.add_scalar('train/loss', avg_epoch_loss, epo + 1)
@@ -267,6 +272,10 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
             writer.add_scalar('train/loss_grad', avg_loss_dict['loss_grad'], epo + 1)
             writer.add_scalar('train/loss_ssim', avg_loss_dict['loss_ssim'], epo + 1)
             writer.add_scalar('train/loss_bloom', avg_loss_dict['loss_bloom'], epo + 1)
+            writer.add_scalar('train/loss_halo', avg_loss_dict['loss_halo'], epo + 1)
+            writer.add_scalar('train/m_mean', avg_loss_dict['m_mean'], epo + 1)
+            writer.add_scalar('train/mhalo_mean', avg_loss_dict['mhalo_mean'], epo + 1)
+            writer.add_scalar('train/mbase_mean', avg_loss_dict['mbase_mean'], epo + 1)
             writer.add_scalar('train/lr', current_lr, epo + 1)
             writer.add_scalar('train/grad_norm', float(grad_norm), epo + 1)
 

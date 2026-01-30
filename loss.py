@@ -174,14 +174,46 @@ class fusion_loss(nn.Module):
     def __init__(self,
                  blur_ks=9,
                  tau=0.20,
+                 # mask for salient IR region M
                  mask_slope=20.0,
-                 thr_sigma=0.5):
+                 thr_sigma=0.5,
+                 # detail soft select
+                 kappa_detail=15.0,
+                 # halo ring
+                 ring_ks=9,          # dilation kernel size (odd)
+                 eta_halo=15.0,      # slope for halo candidate h
+                 delta_halo=0.02,    # tolerance threshold δ in (BV - BI - δ)
+                 eps_bloom=0.02,     # ε_bloom
+                 eps_halo=0.02,      # ε_halo
+                 # weights
+                 alpha_base=1.0,
+                 alpha_detail=3.0,
+                 beta_grad=2.0,
+                 gamma_ssim=0.2,
+                 lambda_bloom=0.2,
+                 lambda_halo=0.2,
+                 ):
         super().__init__()
 
         self.blur_ks = blur_ks
         self.tau = tau
         self.mask_slope = mask_slope
         self.thr_sigma = thr_sigma
+
+        self.kappa_detail = kappa_detail
+
+        self.ring_ks = ring_ks
+        self.eta_halo = eta_halo
+        self.delta_halo = delta_halo
+        self.eps_bloom = eps_bloom
+        self.eps_halo = eps_halo
+
+        self.alpha_base = alpha_base
+        self.alpha_detail = alpha_detail
+        self.beta_grad = beta_grad
+        self.gamma_ssim = gamma_ssim
+        self.lambda_bloom = lambda_bloom
+        self.lambda_halo = lambda_halo
 
         self.grad_loss = SoftGradlossAligned(
             scales=(1.0, 0.5, 0.25),
@@ -191,6 +223,18 @@ class fusion_loss(nn.Module):
     def _blur(self, x):
         k = self.blur_ks
         return F.avg_pool2d(x, k, stride=1, padding=k // 2)
+
+    def _dilate_soft(self, m):
+        """Differentiable-ish dilation via maxpool (but we will detach masks anyway)."""
+        k = self.ring_ks
+        return F.max_pool2d(m, kernel_size=k, stride=1, padding=k // 2)
+
+    @staticmethod
+    def _weighted_l1(pred, target, weight, eps=1e-6):
+        # pred/target/weight: (B,1,H,W)
+        num = (weight * (pred - target).abs()).sum()
+        den = weight.sum() + eps
+        return num / den
 
     def forward(self, ir, vis, fused):
         """
@@ -203,15 +247,40 @@ class fusion_loss(nn.Module):
         # -------------------------
         # 1) Base / Detail decomposition
         # -------------------------
-        ir_b   = self._blur(ir)
-        vis_b  = self._blur(vis)
+        ir_b    = self._blur(ir)
+        vis_b   = self._blur(vis)
         fused_b = self._blur(fused_clamp)
 
-        ir_d   = ir - ir_b
+        ir_d    = ir - ir_b
+        vis_d   = vis - vis_b
         fused_d = fused_clamp - fused_b
 
         # -------------------------
-        # 2) Base loss: soft-max fusion
+        # 2) Salient IR mask M (detached, per paper)
+        # -------------------------
+        ir_mean = ir.mean(dim=[2, 3], keepdim=True)
+        ir_std  = ir.std(dim=[2, 3], keepdim=True) + 1e-6
+        thr = ir_mean + self.thr_sigma * ir_std
+
+        M = torch.sigmoid(self.mask_slope * (ir - thr)).detach()  # (B,1,H,W)
+
+        # -------------------------
+        # 3) Halo-ring mask Mhalo = Mring * h  (detached)
+        #    Mring = clip(dilate(M) - M, 0, 1)
+        #    h = sigmoid(eta * (BV - BI - delta))
+        # -------------------------
+        Mdil = self._dilate_soft(M)
+        Mring = (Mdil - M).clamp(0.0, 1.0)
+
+        h = torch.sigmoid(self.eta_halo * (vis_b - ir_b - self.delta_halo))
+        Mhalo = (Mring * h).detach()
+
+        # background mask for base loss
+        Mbase = ((1.0 - M) * (1.0 - Mhalo)).detach()
+
+        # -------------------------
+        # 4) Base loss (LOW-FREQ): softmax target, ONLY on background Mbase
+        #    BT = αI*BI + αV*BV  where α = softmax([BI/τ, BV/τ])
         # -------------------------
         w = torch.softmax(
             torch.cat([ir_b / self.tau, vis_b / self.tau], dim=1),
@@ -219,62 +288,64 @@ class fusion_loss(nn.Module):
         )
         w_ir, w_vis = w[:, 0:1], w[:, 1:2]
         target_b = w_ir * ir_b + w_vis * vis_b
-        loss_base = F.l1_loss(fused_b, target_b)
+        loss_base = self._weighted_l1(fused_b, target_b, Mbase)
 
         # -------------------------
-        # 3) IR bright-region mask
+        # 5) Detail loss (HIGH-FREQ): soft selection inside salient region M
+        #    wD = sigmoid(kappaD * (|DI| - |DV|))
+        #    DT = wD*DI + (1-wD)*DV
+        #    Ldetail = E[ M * |DF - DT| ]
         # -------------------------
-        ir_mean = ir.mean(dim=[2, 3], keepdim=True)
-        ir_std  = ir.std(dim=[2, 3], keepdim=True) + 1e-6
-        thr = ir_mean + self.thr_sigma * ir_std
-
-        m = torch.sigmoid(self.mask_slope * (ir - thr)).detach()
-
-        # -------------------------
-        # 4) Detail loss (IR shape prior)
-        # -------------------------
-        loss_detail = (m * (fused_d - ir_d).abs()).mean()
+        wD = torch.sigmoid(self.kappa_detail * (ir_d.abs() - vis_d.abs()))
+        DT = wD * ir_d + (1.0 - wD) * vis_d
+        loss_detail = (M * (fused_d - DT).abs()).sum() / (M.sum() + 1e-6)
 
         # -------------------------
-        # 5) Soft gradient aligned loss
+        # 6) Soft gradient aligned loss (global)
         # -------------------------
-        loss_grad = self.grad_loss(vis, ir, fused_raw)
+        loss_grad = self.grad_loss(vis, ir, fused_clamp)
 
         # -------------------------
-        # 6) Bloom suppression (conditional)
+        # 7) Bloom loss (LOW-FREQ upper bound INSIDE M)
+        #    Lbloom = E[ M * relu(BF - (BI + eps_bloom)) ]
         # -------------------------
-        loss_bloom = (m * F.relu(fused_b - vis_b)).mean()
+        loss_bloom = (M * F.relu(fused_b - (ir_b + self.eps_bloom))).sum() / (M.sum() + 1e-6)
 
-        # ---------- Region-aware SSIM ----------
+        # -------------------------
+        # 8) Halo-ring loss (LOW-FREQ upper bound IN Mhalo)
+        #    Lhalo = E[ Mhalo * relu(BF - (BI + eps_halo)) ]
+        # -------------------------
+        loss_halo = (Mhalo * F.relu(fused_b - (ir_b + self.eps_halo))).sum() / (Mhalo.sum() + 1e-6)
+
+        # -------------------------
+        # 9) Region-aware SSIM (ONLY background)
+        # -------------------------
         ssim_map = ssim_map_fn(fused_clamp, vis, data_range=1.0)
-        w_bg = (1.0 - m)
-        loss_ssim = (w_bg * (1.0 - ssim_map)).sum() / (w_bg.sum() + 1e-6)
+        loss_ssim = (Mbase * (1.0 - ssim_map)).sum() / (Mbase.sum() + 1e-6)
 
         # -------------------------
-        # 8) Weights
+        # 10) Total
         # -------------------------
-        alpha_base   = 1.0
-        alpha_detail = 3.0
-        beta_grad    = 2.0
-        gamma_ssim   = 0.2
-        lambda_bloom = 0.2
-
         loss = (
-            alpha_base * loss_base +
-            alpha_detail * loss_detail +
-            beta_grad * loss_grad +
-            gamma_ssim * loss_ssim +
-            lambda_bloom * loss_bloom
+            self.alpha_base   * loss_base +
+            self.alpha_detail * loss_detail +
+            self.beta_grad    * loss_grad +
+            self.gamma_ssim   * loss_ssim +
+            self.lambda_bloom * loss_bloom +
+            self.lambda_halo  * loss_halo
         )
 
         return loss, {
-            "loss_base": loss_base.item(),
-            "loss_detail": loss_detail.item(),
-            "loss_grad": loss_grad.item(),
-            "loss_ssim": loss_ssim.item(),
-            "loss_bloom": loss_bloom.item()
+            "loss_base":  float(loss_base.detach().cpu()),
+            "loss_detail": float(loss_detail.detach().cpu()),
+            "loss_grad":  float(loss_grad.detach().cpu()),
+            "loss_ssim":  float(loss_ssim.detach().cpu()),
+            "loss_bloom": float(loss_bloom.detach().cpu()),
+            "loss_halo":  float(loss_halo.detach().cpu()),
+            "m_mean":     float(M.mean().detach().cpu()),
+            "mhalo_mean": float(Mhalo.mean().detach().cpu()),
+            "mbase_mean": float(Mbase.mean().detach().cpu()),
         }
-
 
 
 
