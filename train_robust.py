@@ -20,6 +20,9 @@ import numpy as np
 
 warnings.filterwarnings('ignore')
 
+# 是否在 TensorBoard 预览中展示掩膜图（M, Mbase, Mhalo）
+PREVIEW_WITH_MASK = True
+
 def seed_everything(seed=3407):
     os.environ['PYTHONHASHSEED'] = str(seed)
     os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
@@ -41,58 +44,8 @@ def seed_worker(worker_id):
     random.seed(worker_seed)
 
 
-def attack(
-    image_vis,
-    image_ir,
-    model,
-    loss,
-    step_size=1 / 255,
-    total_steps=3,
-    epsilon=4 / 255,
-):
-
-
-    model.eval()
-
-    # random start in [-epsilon, epsilon]
-    adv_img_vis = (image_vis + torch.empty_like(image_vis).uniform_(-epsilon, epsilon)).clamp(0, 1).detach()
-    adv_img_ir  = (image_ir  + torch.empty_like(image_ir ).uniform_(-epsilon, epsilon)).clamp(0, 1).detach()
-
-    adv_img_vis.requires_grad_(True)
-    adv_img_ir.requires_grad_(True)
-
-    for _ in range(total_steps):
-        model.zero_grad(set_to_none=True)
-        if adv_img_vis.grad is not None:
-            adv_img_vis.grad = None
-        if adv_img_ir.grad is not None:
-            adv_img_ir.grad = None
-
-        fused = model(adv_img_vis, adv_img_ir)
-        loss_total = loss(adv_img_ir, adv_img_vis, fused)
-        loss_total.backward()
-
-        with torch.no_grad():
-
-            assert adv_img_vis.grad is not None and adv_img_ir.grad is not None
-            adv_img_vis = adv_img_vis + step_size * adv_img_vis.grad.sign()
-            adv_img_ir  = adv_img_ir  + step_size * adv_img_ir .grad.sign()
-
-            adv_img_vis = image_vis + (adv_img_vis - image_vis).clamp(-epsilon, epsilon)
-            adv_img_ir  = image_ir  + (adv_img_ir  - image_ir ).clamp(-epsilon, epsilon)
-
-            adv_img_vis.clamp_(0, 1)
-            adv_img_ir.clamp_(0, 1)
-
-        adv_img_vis = adv_img_vis.detach().requires_grad_(True)
-        adv_img_ir  = adv_img_ir.detach().requires_grad_(True)
-
-    return adv_img_vis, adv_img_ir
-
-
-
-
-def make_preview_tensor(image_vis, image_ir, fused_y, image_vis_ycrcb=None):
+def make_preview_tensor(image_vis, image_ir, fused_y, image_vis_ycrcb=None,
+                        M=None, Mbase=None, Mhalo=None):
     """
     Create preview tensor with RGB images: [VIS | IR | FUSED_RGB]
     
@@ -102,10 +55,10 @@ def make_preview_tensor(image_vis, image_ir, fused_y, image_vis_ycrcb=None):
         fused_y: Fused Y channel [B, 1, H, W]
         image_vis_ycrcb: Optional YCrCb visible image [B, 3, H, W]
     """
-    vis = image_vis[0].detach().cpu().clamp(0, 1)
-    ir = image_ir[0].detach().cpu().clamp(0, 1)
+    vis = image_vis[0].detach().cpu().clamp(0, 1)  # [3, H, W]
+    ir = image_ir[0].detach().cpu().clamp(0, 1)    # [1, H, W]
     
-    # Convert IR to RGB for display
+    # Convert IR to RGB for display (灰度复制到 3 通道)
     if ir.shape[0] == 1:
         ir = ir.repeat(3, 1, 1)
     
@@ -123,8 +76,24 @@ def make_preview_tensor(image_vis, image_ir, fused_y, image_vis_ycrcb=None):
         if fused_rgb.shape[0] == 1:
             fused_rgb = fused_rgb.repeat(3, 1, 1)
 
-    # Concatenate along width: [VIS | IR | FUSED_RGB]
-    preview = torch.cat([vis, ir, fused_rgb], dim=2)
+    # 掩膜可视化：单通道复制成 3 通道
+    def mask_to_rgb(mask):
+        # mask: [B,1,H,W]
+        m = mask[0].detach().cpu().clamp(0, 1)  # [1, H, W]
+        if m.shape[0] == 1:
+            m = m.repeat(3, 1, 1)               # [3, H, W]
+        return m
+
+    if (M is not None) and (Mbase is not None) and (Mhalo is not None):
+        M_rgb = mask_to_rgb(M)
+        Mbase_rgb = mask_to_rgb(Mbase)
+        Mhalo_rgb = mask_to_rgb(Mhalo)
+        # 按顺序拼接：IR | VI | M | Mbase | Mhalo | FusedRGB
+        preview = torch.cat([ir, vis, M_rgb, Mbase_rgb, Mhalo_rgb, fused_rgb], dim=2)
+    else:
+        # 兼容旧逻辑：VIS | IR | FusedRGB
+        preview = torch.cat([vis, ir, fused_rgb], dim=2)
+
     return preview
 
 
@@ -214,7 +183,7 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
                 optimizer.zero_grad()
 
 
-                loss_total, loss_dict = train_loss(image_ir, image_vis_ycrcb[:, 0:1, :, :], logits)
+                loss_total, loss_dict, _ = train_loss(image_ir, image_vis_ycrcb[:, 0:1, :, :], logits)
                 # loss_total_adv, loss_mse_adv, loss_ssim_adv = train_loss(logits_adv, image_gt_ycbcr)
 
                 # loss = loss_total + loss_total_adv
@@ -296,8 +265,23 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
                     fused_clamped = fused.clamp(0, 1)
 
                     if tb_image_every > 0 and (epo % tb_image_every == 0) and it < 3:
-                        # 生成RGB融合图像
-                        preview = make_preview_tensor(image_vis, image_ir, fused_clamped, image_vis_ycrcb)
+                        if PREVIEW_WITH_MASK:
+                            # 计算 loss 以获得掩膜用于可视化（不参与梯度）
+                            loss_val, _, mask_dict = train_loss(image_ir, image_vis_y, fused)
+                            M = mask_dict["M"]
+                            Mbase = mask_dict["Mbase"]
+                            Mhalo = mask_dict["Mhalo"]
+
+                            # 生成 RGB 融合图像 + 掩膜预览（IR | VI | M | Mbase | Mhalo | FusedRGB）
+                            preview = make_preview_tensor(
+                                image_vis, image_ir, fused_clamped, image_vis_ycrcb,
+                                M, Mbase, Mhalo
+                            )
+                        else:
+                            # 只展示原始三图预览：VIS | IR | FusedRGB
+                            preview = make_preview_tensor(
+                                image_vis, image_ir, fused_clamped, image_vis_ycrcb
+                            )
                         writer.add_image(f'val/preview_{it}', preview, epo + 1)
                         
                         if it == 0:

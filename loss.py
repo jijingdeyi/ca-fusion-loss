@@ -335,7 +335,8 @@ class fusion_loss(nn.Module):
             self.lambda_halo  * loss_halo
         )
 
-        return loss, {
+        # 标量日志信息
+        loss_stats = {
             "loss_base":  float(loss_base.detach().cpu()),
             "loss_detail": float(loss_detail.detach().cpu()),
             "loss_grad":  float(loss_grad.detach().cpu()),
@@ -346,6 +347,16 @@ class fusion_loss(nn.Module):
             "mhalo_mean": float(Mhalo.mean().detach().cpu()),
             "mbase_mean": float(Mbase.mean().detach().cpu()),
         }
+
+        # 掩膜张量（用于可视化）
+        mask_dict = {
+            "M": M,
+            "Mbase": Mbase,
+            "Mhalo": Mhalo,
+        }
+
+        # 返回：总 loss、标量日志、掩膜
+        return loss, loss_stats, mask_dict
 
 
 
