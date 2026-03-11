@@ -173,7 +173,7 @@ class SoftGradlossAligned(nn.Module):
 class fusion_loss(nn.Module):
     def __init__(self,
                  blur_ks=9,
-                 tau=0.20,
+                 tau=0.30,
                  # mask for salient IR region M
                  mask_slope=20.0,
                  thr_sigma=0.5,
@@ -182,16 +182,16 @@ class fusion_loss(nn.Module):
                  # halo ring
                  ring_ks=9,          # dilation kernel size (odd)
                  eta_halo=15.0,      # slope for halo candidate h
-                 delta_halo=0.02,    # tolerance threshold δ in (BV - BI - δ)
+                 delta_halo=0.5,    # tolerance threshold δ in (BV - BI - δ)
                  eps_bloom=0.02,     # ε_bloom
                  eps_halo=0.02,      # ε_halo
                  # weights
                  alpha_base=1.0,
-                 alpha_detail=3.0,
-                 beta_grad=2.0,
+                 alpha_detail=4.0,
+                 beta_grad=3.0,
                  gamma_ssim=0.2,
-                 lambda_bloom=0.2,
-                 lambda_halo=0.2,
+                 lambda_bloom=0.1,
+                 lambda_halo=0.1,
                  ):
         super().__init__()
 
