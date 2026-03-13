@@ -179,19 +179,20 @@ class fusion_loss(nn.Module):
                  thr_sigma=0.5,
                  # detail soft select
                  kappa_detail=15.0,
-                 # halo ring
-                 ring_ks=9,          # dilation kernel size (odd)
+                 # halo ring（ring_ks 越小环越窄；lambda_halo/eps_halo 过大会在目标周围压出黑边）
+                 ring_ks=3,          # dilation kernel size (odd)，5→约2像素环宽，9→约4像素
                  eta_halo=15.0,      # slope for halo candidate h
                  delta_halo=0.5,    # tolerance threshold δ in (BV - BI - δ)
+                 ir_brightness_thr=0.4,  # IR 亮度下限，仅用于 M_hard：只有 ir > 此值才视为高置信目标参与膨胀
                  eps_bloom=0.02,     # ε_bloom
-                 eps_halo=0.02,      # ε_halo
+                 eps_halo=0.04,      # ε_halo，略放宽可减轻黑边
                  # weights
                  alpha_base=1.0,
                  alpha_detail=4.0,
                  beta_grad=3.0,
                  gamma_ssim=0.2,
                  lambda_bloom=0.1,
-                 lambda_halo=0.1,
+                 lambda_halo=0.04,   # 过大会在目标周围压出明显黑边，可适当减小
                  ):
         super().__init__()
 
@@ -205,6 +206,7 @@ class fusion_loss(nn.Module):
         self.ring_ks = ring_ks
         self.eta_halo = eta_halo
         self.delta_halo = delta_halo
+        self.ir_brightness_thr = ir_brightness_thr
         self.eps_bloom = eps_bloom
         self.eps_halo = eps_halo
 
@@ -230,10 +232,10 @@ class fusion_loss(nn.Module):
         return F.max_pool2d(m, kernel_size=k, stride=1, padding=k // 2)
 
     @staticmethod
-    def _weighted_l1(pred, target, weight, eps=1e-6):
-        # pred/target/weight: (B,1,H,W)
+    def _weighted_l1(pred, target, weight, eps=1e-6, min_den=1.0):
+        # pred/target/weight: (B,1,H,W)；min_den 防止 Mbase 极稀疏时分母过小导致 loss 爆炸
         num = (weight * (pred - target).abs()).sum()
-        den = weight.sum() + eps
+        den = (weight.sum() + eps).clamp(min=min_den)
         return num / den
 
     def forward(self, ir, vis, fused):
@@ -256,27 +258,42 @@ class fusion_loss(nn.Module):
         fused_d = fused_clamp - fused_b
 
         # -------------------------
-        # 2) Salient IR mask M (detached, per paper)
+        # 2) Local-contrast salient masks (soft + hard)
+        #    ir_bg: local background via avg pooling
+        #    S    : local contrast
         # -------------------------
-        ir_mean = ir.mean(dim=[2, 3], keepdim=True)
-        ir_std  = ir.std(dim=[2, 3], keepdim=True) + 1e-6
-        thr = ir_mean + self.thr_sigma * ir_std
+        ir_bg = F.avg_pool2d(ir, kernel_size=15, stride=1, padding=7)
+        S = ir - ir_bg
 
-        M = torch.sigmoid(self.mask_slope * (ir - thr)).detach()  # (B,1,H,W)
+        s_mean = S.mean(dim=[2, 3], keepdim=True)
+        s_std  = S.std(dim=[2, 3], keepdim=True) + 1e-6
+
+        # soft mask for detail / bloom
+        thr_soft = s_mean + self.thr_sigma * s_std
+        M_soft = torch.sigmoid(self.mask_slope * (S - thr_soft)).detach()  # (B,1,H,W)
+
+        # hard mask for halo branch（高置信目标：局部对比高 且 红外亮度足够）
+        # 仅此 mask 用于膨胀生成 halo，避免树叶旁暗天空等被误判为 halo
+        thr_hard = s_mean + 1.5 * s_std
+        M_hard = ((S > thr_hard) & (ir > self.ir_brightness_thr)).float().detach()
 
         # -------------------------
         # 3) Halo-ring mask Mhalo = Mring * h  (detached)
-        #    Mring = clip(dilate(M) - M, 0, 1)
+        #    Mring = clip(dilate(M_hard) - M_hard, 0, 1)
         #    h = sigmoid(eta * (BV - BI - delta))
         # -------------------------
-        Mdil = self._dilate_soft(M)
-        Mring = (Mdil - M).clamp(0.0, 1.0)
+        Mdil = self._dilate_soft(M_hard)
+        Mring = (Mdil - M_hard).clamp(0.0, 1.0)
 
         h = torch.sigmoid(self.eta_halo * (vis_b - ir_b - self.delta_halo))
         Mhalo = (Mring * h).detach()
 
-        # background mask for base loss
-        Mbase = ((1.0 - M) * (1.0 - Mhalo)).detach()
+        # background mask for base loss:
+        # strictly "non-target & non-halo", using hard mask
+        #   - M_hard: definite salient IR (target)
+        #   - Mhalo : halo ring around target
+        # base 区域 = 既不是目标区域，也不是 halo 区域
+        Mbase = ((1.0 - M_hard) * (1.0 - Mhalo)).detach()
 
         # -------------------------
         # 4) Base loss (LOW-FREQ): softmax target, ONLY on background Mbase
@@ -288,17 +305,18 @@ class fusion_loss(nn.Module):
         )
         w_ir, w_vis = w[:, 0:1], w[:, 1:2]
         target_b = w_ir * ir_b + w_vis * vis_b
-        loss_base = self._weighted_l1(fused_b, target_b, Mbase)
+        loss_base = self._weighted_l1(fused_b, target_b, Mbase, min_den=1.0)
 
         # -------------------------
-        # 5) Detail loss (HIGH-FREQ): soft selection inside salient region M
+        # 5) Detail loss (HIGH-FREQ): soft selection inside salient region M_soft
         #    wD = sigmoid(kappaD * (|DI| - |DV|))
         #    DT = wD*DI + (1-wD)*DV
-        #    Ldetail = E[ M * |DF - DT| ]
+        #    Ldetail = E[ M_soft * |DF - DT| ]
         # -------------------------
         wD = torch.sigmoid(self.kappa_detail * (ir_d.abs() - vis_d.abs()))
         DT = wD * ir_d + (1.0 - wD) * vis_d
-        loss_detail = (M * (fused_d - DT).abs()).sum() / (M.sum() + 1e-6)
+        sum_m_soft = (M_soft.sum() + 1e-6).clamp(min=1.0)
+        loss_detail = (M_soft * (fused_d - DT).abs()).sum() / sum_m_soft
 
         # -------------------------
         # 6) Soft gradient aligned loss (global)
@@ -306,22 +324,24 @@ class fusion_loss(nn.Module):
         loss_grad = self.grad_loss(vis, ir, fused_clamp)
 
         # -------------------------
-        # 7) Bloom loss (LOW-FREQ upper bound INSIDE M)
-        #    Lbloom = E[ M * relu(BF - (BI + eps_bloom)) ]
+        # 7) Bloom loss (LOW-FREQ upper bound INSIDE M_soft)
+        #    Lbloom = E[ M_soft * relu(BF - (BI + eps_bloom)) ]
         # -------------------------
-        loss_bloom = (M * F.relu(fused_b - (ir_b + self.eps_bloom))).sum() / (M.sum() + 1e-6)
+        loss_bloom = (M_soft * F.relu(fused_b - (ir_b + self.eps_bloom))).sum() / sum_m_soft
 
         # -------------------------
         # 8) Halo-ring loss (LOW-FREQ upper bound IN Mhalo)
         #    Lhalo = E[ Mhalo * relu(BF - (BI + eps_halo)) ]
         # -------------------------
-        loss_halo = (Mhalo * F.relu(fused_b - (ir_b + self.eps_halo))).sum() / (Mhalo.sum() + 1e-6)
+        sum_mhalo = (Mhalo.sum() + 1e-6).clamp(min=1.0)
+        loss_halo = (Mhalo * F.relu(fused_b - (ir_b + self.eps_halo))).sum() / sum_mhalo
 
         # -------------------------
         # 9) Region-aware SSIM (ONLY background)
         # -------------------------
         ssim_map = ssim_map_fn(fused_clamp, vis, data_range=1.0)
-        loss_ssim = (Mbase * (1.0 - ssim_map)).sum() / (Mbase.sum() + 1e-6)
+        sum_mbase = (Mbase.sum() + 1e-6).clamp(min=1.0)
+        loss_ssim = (Mbase * (1.0 - ssim_map)).sum() / sum_mbase
 
         # -------------------------
         # 10) Total
@@ -343,14 +363,15 @@ class fusion_loss(nn.Module):
             "loss_ssim":  float(loss_ssim.detach().cpu()),
             "loss_bloom": float(loss_bloom.detach().cpu()),
             "loss_halo":  float(loss_halo.detach().cpu()),
-            "m_mean":     float(M.mean().detach().cpu()),
+            "m_mean":     float(M_soft.mean().detach().cpu()),
             "mhalo_mean": float(Mhalo.mean().detach().cpu()),
             "mbase_mean": float(Mbase.mean().detach().cpu()),
         }
 
         # 掩膜张量（用于可视化）
         mask_dict = {
-            "M": M,
+            "M": M_soft,
+            "Mhard": M_hard,
             "Mbase": Mbase,
             "Mhalo": Mhalo,
         }
