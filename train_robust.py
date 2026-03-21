@@ -6,7 +6,7 @@ import time
 import logging
 import os
 from logger import setup_logger
-from loss import fusion_loss
+from loss_mef import fusion_loss_mef
 import torch
 from torch.utils.tensorboard import SummaryWriter
 import warnings
@@ -20,8 +20,8 @@ import numpy as np
 
 warnings.filterwarnings('ignore')
 
-# 是否在 TensorBoard 预览中展示掩膜图（M, Mbase, Mhalo）
-PREVIEW_WITH_MASK = True
+# MEF loss 不返回掩膜，这里关闭掩膜预览
+PREVIEW_WITH_MASK = False
 
 def seed_everything(seed=3407):
     os.environ['PYTHONHASHSEED'] = str(seed)
@@ -116,7 +116,7 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
         optimizer, mode='max', factor=0.75, patience=2, min_lr=1e-6
     )
 
-    train_loss = fusion_loss()
+    train_loss = fusion_loss_mef()
     train_loss.to(device)  
     epoch = 50
 
@@ -141,9 +141,9 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
             
             epoch_losses = []
             epoch_loss_dict = {
-                'loss_base': [], 'loss_detail': [], 'loss_grad': [], 
-                'loss_ssim': [], 'loss_bloom': [], 'loss_halo': [],
-                'm_mean': [], 'mhalo_mean': [], 'mbase_mean': []
+                'loss_grad': [],
+                'loss_l1': [],
+                'loss_ssim': [],
             }
             
             for it, (image_ir, image_vis) in enumerate(trainloader):
@@ -183,7 +183,9 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
                 optimizer.zero_grad()
 
 
-                loss_total, loss_dict, _ = train_loss(image_ir, image_vis_ycrcb[:, 0:1, :, :], logits)
+                loss_total, loss_grad, loss_l1, loss_ssim = train_loss(
+                    image_ir, image_vis_ycrcb[:, 0:1, :, :], logits
+                )
                 # loss_total_adv, loss_mse_adv, loss_ssim_adv = train_loss(logits_adv, image_gt_ycbcr)
 
                 # loss = loss_total + loss_total_adv
@@ -196,8 +198,9 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
                 
                 # 累积loss用于epoch平均
                 epoch_losses.append(loss.item())
-                for key in epoch_loss_dict:
-                    epoch_loss_dict[key].append(loss_dict[key])
+                epoch_loss_dict['loss_grad'].append(float(loss_grad.detach().cpu()))
+                epoch_loss_dict['loss_l1'].append(float(loss_l1.detach().cpu()))
+                epoch_loss_dict['loss_ssim'].append(float(loss_ssim.detach().cpu()))
                 
                 loss.backward()
                 
@@ -224,27 +227,15 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
             avg_loss_dict = {key: sum(vals) / len(vals) if vals else 0.0 
                             for key, vals in epoch_loss_dict.items()}
             logger.info(f"Epoch {epo+1}/{epoch} - Train Loss: {avg_epoch_loss:.4f} "
-                        f"(base: {avg_loss_dict['loss_base']:.4f}, "
-                        f"detail: {avg_loss_dict['loss_detail']:.4f}, "
+                        f"(l1: {avg_loss_dict['loss_l1']:.4f}, "
                         f"grad: {avg_loss_dict['loss_grad']:.4f}, "
                         f"ssim: {avg_loss_dict['loss_ssim']:.4f}, "
-                        f"bloom: {avg_loss_dict['loss_bloom']:.4f}, "
-                        f"halo: {avg_loss_dict['loss_halo']:.4f}, "
-                        f"M: {avg_loss_dict['m_mean']:.4f}, "
-                        f"Mhalo: {avg_loss_dict['mhalo_mean']:.4f}, "
-                        f"Mbase: {avg_loss_dict['mbase_mean']:.4f}, "
-                        f"LR: {current_lr:.6f}")
+                        f"LR: {current_lr:.6f})")
 
             writer.add_scalar('train/loss', avg_epoch_loss, epo + 1)
-            writer.add_scalar('train/loss_base', avg_loss_dict['loss_base'], epo + 1)
-            writer.add_scalar('train/loss_detail', avg_loss_dict['loss_detail'], epo + 1)
             writer.add_scalar('train/loss_grad', avg_loss_dict['loss_grad'], epo + 1)
+            writer.add_scalar('train/loss_l1', avg_loss_dict['loss_l1'], epo + 1)
             writer.add_scalar('train/loss_ssim', avg_loss_dict['loss_ssim'], epo + 1)
-            writer.add_scalar('train/loss_bloom', avg_loss_dict['loss_bloom'], epo + 1)
-            writer.add_scalar('train/loss_halo', avg_loss_dict['loss_halo'], epo + 1)
-            writer.add_scalar('train/m_mean', avg_loss_dict['m_mean'], epo + 1)
-            writer.add_scalar('train/mhalo_mean', avg_loss_dict['mhalo_mean'], epo + 1)
-            writer.add_scalar('train/mbase_mean', avg_loss_dict['mbase_mean'], epo + 1)
             writer.add_scalar('train/lr', current_lr, epo + 1)
             writer.add_scalar('train/grad_norm', float(grad_norm), epo + 1)
 
@@ -265,23 +256,10 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
                     fused_clamped = fused.clamp(0, 1)
 
                     if tb_image_every > 0 and (epo % tb_image_every == 0) and it < 3:
-                        if PREVIEW_WITH_MASK:
-                            # 计算 loss 以获得掩膜用于可视化（不参与梯度）
-                            loss_val, _, mask_dict = train_loss(image_ir, image_vis_y, fused)
-                            M = mask_dict["M"]
-                            Mbase = mask_dict["Mbase"]
-                            Mhalo = mask_dict["Mhalo"]
-
-                            # 生成 RGB 融合图像 + 掩膜预览（IR | VI | M | Mbase | Mhalo | FusedRGB）
-                            preview = make_preview_tensor(
-                                image_vis, image_ir, fused_clamped, image_vis_ycrcb,
-                                M, Mbase, Mhalo
-                            )
-                        else:
-                            # 只展示原始三图预览：VIS | IR | FusedRGB
-                            preview = make_preview_tensor(
-                                image_vis, image_ir, fused_clamped, image_vis_ycrcb
-                            )
+                        # MEF loss 不含掩膜，固定展示原始三图：VIS | IR | FusedRGB
+                        preview = make_preview_tensor(
+                            image_vis, image_ir, fused_clamped, image_vis_ycrcb
+                        )
                         writer.add_image(f'val/preview_{it}', preview, epo + 1)
                         
                         if it == 0:

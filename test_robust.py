@@ -114,7 +114,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--checkpoint",
-        default="model/A2RNet-20260311-134129-best.pth",
+        default="model/A2RNet-20260320-192735-best.pth",
         type=str,
         nargs="?",
         help="checkpoint path",
