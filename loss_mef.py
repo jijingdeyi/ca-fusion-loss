@@ -62,12 +62,10 @@ class fusion_loss_mef(nn.Module):
     def __init__(self,
                  blur_ks=9,
                  mask_slope=20.0,
-                 thr_sigma=0.5,
                  vis_brightness_thr=0.6,
                  ring_ks=3,
                  eta_halo=15.0,
                  delta_halo=0.5,
-                 ir_brightness_thr=0.4,
                  eps_halo=0.04,
                  lambda_halo=0.1):
         super(fusion_loss_mef, self).__init__()
@@ -76,12 +74,10 @@ class fusion_loss_mef(nn.Module):
         self.L_SSIM = L_SSIM()
         self.blur_ks = blur_ks
         self.mask_slope = mask_slope
-        self.thr_sigma = thr_sigma
         self.vis_brightness_thr = vis_brightness_thr
         self.ring_ks = ring_ks
         self.eta_halo = eta_halo
         self.delta_halo = delta_halo
-        self.ir_brightness_thr = ir_brightness_thr
         self.eps_halo = eps_halo
         self.lambda_halo = lambda_halo
 
@@ -91,23 +87,50 @@ class fusion_loss_mef(nn.Module):
     def _dilate(self, x):
         return F.max_pool2d(x, kernel_size=self.ring_ks, stride=1, padding=self.ring_ks // 2)
 
-    def get_saliency_masks(self, image_A):
-        """Return M_soft and M_hard using loss.py-style multi-scale local contrast."""
-        ir1 = image_A[:, :1, :, :]
-        window_sizes = [15, 31]
-        S_multi = []
-        for k in window_sizes:
-            ir_bg_k = F.avg_pool2d(ir1, kernel_size=k, stride=1, padding=k // 2)
-            S_multi.append(ir1 - ir_bg_k)
-        S = torch.stack(S_multi, dim=0).max(dim=0)[0]
+    @staticmethod
+    def _erode(x, k):
+        # min-pooling via negative max-pooling
+        return -F.max_pool2d(-x, kernel_size=k, stride=1, padding=k // 2)
 
-        s_mean = S.mean(dim=[2, 3], keepdim=True)
-        s_std = S.std(dim=[2, 3], keepdim=True) + 1e-6
-        thr_soft = s_mean + self.thr_sigma * s_std
+    def _opening(self, x, k):
+        # grayscale opening = dilate(erode(x))
+        eroded = self._erode(x, k)
+        return F.max_pool2d(eroded, kernel_size=k, stride=1, padding=k // 2)
+
+    @staticmethod
+    def _compute_quantile(x, q):
+        # Per-image quantile (no cross-image mixing)
+        B = x.shape[0]
+        x_flat = x.view(B, -1)
+        q_val = torch.quantile(x_flat, q, dim=1, keepdim=True)
+        return q_val.view(B, 1, 1, 1)
+
+    def get_saliency_masks(self, image_A):
+        """Return M_soft and M_hard using multi-scale Top-hat + quantile thresholds."""
+        ir1 = image_A[:, :1, :, :]
+        kernel_sizes = [9, 15, 31]
+
+        S_multi = []
+        for k in kernel_sizes:
+            if k % 2 == 0:
+                raise ValueError(f"Kernel size must be odd, got {k}")
+            opened = self._opening(ir1, k)
+            S_k = ir1 - opened  # Top-hat
+            S_multi.append(S_k)
+
+        S = torch.stack(S_multi, dim=0).max(dim=0)[0]
+        S = S / (S.mean(dim=[2, 3], keepdim=True) + 1e-6)
+
+        p_soft = 0.10
+        thr_soft = self._compute_quantile(S, 1.0 - p_soft)
         M_soft = torch.sigmoid(self.mask_slope * (S - thr_soft))
 
-        thr_hard = s_mean + 1.5 * s_std
-        M_hard = ((S > thr_hard) & (ir1 > self.ir_brightness_thr)).float()
+        p_hard = 0.03
+        thr_hard = self._compute_quantile(S, 1.0 - p_hard)
+
+        q_bright = 0.8
+        thr_bright = self._compute_quantile(ir1, q_bright)
+        M_hard = ((S > thr_hard) & (ir1 > thr_bright)).float()
         return M_soft, M_hard
 
     def get_halo_masks(self, image_A, image_B):
