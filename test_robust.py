@@ -107,14 +107,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--outdir",
-        default="./results/msrs_test",
+        default="./results/ori+halo",
         type=str,
         nargs="?",
         help="dir to write fused results",
     )
     parser.add_argument(
         "--checkpoint",
-        default="model/A2RNet-20260320-192735-best.pth",
+        default="model/A2RNet-20260323-145246-best.pth",
         type=str,
         nargs="?",
         help="checkpoint path",

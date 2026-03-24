@@ -60,15 +60,75 @@ class L_Intensity(nn.Module):
 
 
 class fusion_loss_mef(nn.Module):
-    def __init__(self):
+    def __init__(self,
+                 blur_ks=9,
+                 ring_ks=3,
+                 eta_halo=15.0,
+                 delta_halo=0.5,
+                 ir_brightness_thr=0.4,
+                 eps_halo=0.04,
+                 lambda_halo=0.1):
         super(fusion_loss_mef, self).__init__()
         self.L_Grad = L_Grad()
         self.L_Inten = L_Intensity()
         self.L_SSIM = L_SSIM()
+        self.blur_ks = blur_ks
+        self.ring_ks = ring_ks
+        self.eta_halo = eta_halo
+        self.delta_halo = delta_halo
+        self.ir_brightness_thr = ir_brightness_thr
+        self.eps_halo = eps_halo
+        self.lambda_halo = lambda_halo
+
+    def _blur(self, x):
+        return F.avg_pool2d(x, self.blur_ks, stride=1, padding=self.blur_ks // 2)
+
+    def _dilate(self, x):
+        return F.max_pool2d(x, kernel_size=self.ring_ks, stride=1, padding=self.ring_ks // 2)
+
+    def get_halo_masks(self, image_A, image_B):
+        """Return M_hard and Mhalo for visualization.
+        image_A: IR, image_B: VIS-Y
+        """
+        ir1 = image_A[:, :1, :, :]
+        ir_b = self._blur(ir1)
+        vis_b = self._blur(image_B[:, :1, :, :])
+
+        window_sizes = [15, 31]
+        S_multi = []
+        for k in window_sizes:
+            ir_bg_k = F.avg_pool2d(ir1, kernel_size=k, stride=1, padding=k // 2)
+            S_multi.append(ir1 - ir_bg_k)
+        S = torch.stack(S_multi, dim=0).max(dim=0)[0]
+
+        s_mean = S.mean(dim=[2, 3], keepdim=True)
+        s_std = S.std(dim=[2, 3], keepdim=True) + 1e-6
+        thr_hard = s_mean + 1.5 * s_std
+        M_hard = ((S > thr_hard) & (ir1 > self.ir_brightness_thr)).float()
+
+        Mdil = self._dilate(M_hard)
+        Mring = (Mdil - M_hard).clamp(0.0, 1.0)
+        h = torch.sigmoid(self.eta_halo * (vis_b - ir_b - self.delta_halo))
+        Mhalo = Mring * h
+        return M_hard, Mhalo
 
     def forward(self, image_A, image_B, image_fused):
+        # image_A: IR, image_B: VIS-Y, image_fused: fused-Y
         loss_l1 = 20 * self.L_Inten(image_A, image_B, image_fused)
         loss_gradient = 20 * self.L_Grad(image_A, image_B, image_fused)
         loss_SSIM = 10 * (1 - self.L_SSIM(image_A, image_B, image_fused))
-        fusion_loss = loss_l1 + loss_gradient + loss_SSIM
-        return fusion_loss, loss_gradient, loss_l1, loss_SSIM
+
+        # Halo loss branch (adapted from loss.py)
+        ir_b = self._blur(image_A[:, :1, :, :])
+        vis_b = self._blur(image_B[:, :1, :, :])
+        fused_b = self._blur(image_fused[:, :1, :, :]).clamp(0, 1)
+
+        M_hard, Mhalo = self.get_halo_masks(image_A, image_B)
+        M_hard = M_hard.detach()
+        Mhalo = Mhalo.detach()
+
+        sum_mhalo = (Mhalo.sum() + 1e-6).clamp(min=1.0)
+        loss_halo = (Mhalo * F.relu(fused_b - (ir_b + self.eps_halo))).sum() / sum_mhalo
+
+        fusion_loss = loss_l1 + loss_gradient + loss_SSIM + self.lambda_halo * loss_halo
+        return fusion_loss, loss_gradient, loss_l1, loss_SSIM, self.lambda_halo * loss_halo

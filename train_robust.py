@@ -1,10 +1,11 @@
 from Ufuser import Ufuser
 
-from dataset import trainloader, valloader
+from dataset import trainloader, valloader, TRAIN_PATH
 import datetime
 import time
 import logging
 import os
+import glob
 from logger import setup_logger
 from loss_mef import fusion_loss_mef
 import torch
@@ -17,11 +18,14 @@ from metric import VIF_function, Qabf_function
 
 
 import numpy as np
+from PIL import Image
 
 warnings.filterwarnings('ignore')
 
-# MEF loss 不返回掩膜，这里关闭掩膜预览
-PREVIEW_WITH_MASK = False
+# 在 TensorBoard 预览中展示 Mhard 与 Mhalo
+PREVIEW_WITH_MASK = True
+# 固定预览样本（来自 TRAIN_PATH，和 train/val 切分无关）
+PREVIEW_IMAGE_IDS = {"01185N", "01154N", "00326D", "00328D"}
 
 def seed_everything(seed=3407):
     os.environ['PYTHONHASHSEED'] = str(seed)
@@ -45,7 +49,7 @@ def seed_worker(worker_id):
 
 
 def make_preview_tensor(image_vis, image_ir, fused_y, image_vis_ycrcb=None,
-                        M=None, Mbase=None, Mhalo=None):
+                        Mhard=None, Mhalo=None):
     """
     Create preview tensor with RGB images: [VIS | IR | FUSED_RGB]
     
@@ -84,12 +88,11 @@ def make_preview_tensor(image_vis, image_ir, fused_y, image_vis_ycrcb=None,
             m = m.repeat(3, 1, 1)               # [3, H, W]
         return m
 
-    if (M is not None) and (Mbase is not None) and (Mhalo is not None):
-        M_rgb = mask_to_rgb(M)
-        Mbase_rgb = mask_to_rgb(Mbase)
+    if (Mhard is not None) and (Mhalo is not None):
+        Mhard_rgb = mask_to_rgb(Mhard)
         Mhalo_rgb = mask_to_rgb(Mhalo)
-        # 按顺序拼接：IR | VI | M | Mbase | Mhalo | FusedRGB
-        preview = torch.cat([ir, vis, M_rgb, Mbase_rgb, Mhalo_rgb, fused_rgb], dim=2)
+        # 按顺序拼接：IR | VIS | Mhard | Mhalo | FusedRGB
+        preview = torch.cat([ir, vis, Mhard_rgb, Mhalo_rgb, fused_rgb], dim=2)
     else:
         # 兼容旧逻辑：VIS | IR | FusedRGB
         preview = torch.cat([vis, ir, fused_rgb], dim=2)
@@ -97,9 +100,26 @@ def make_preview_tensor(image_vis, image_ir, fused_y, image_vis_ycrcb=None,
     return preview
 
 
+def build_fixed_previews_from_train_path(train_path, preview_ids):
+    """直接从 TRAIN_PATH 读取固定预览样本。"""
+    samples = []
+    for sample_id in sorted(preview_ids):
+        ir_candidates = sorted(glob.glob(os.path.join(train_path, "ir", f"{sample_id}.*")))
+        vi_candidates = sorted(glob.glob(os.path.join(train_path, "vi", f"{sample_id}.*")))
+        if not ir_candidates or not vi_candidates:
+            continue
+        ir_path, vi_path = ir_candidates[0], vi_candidates[0]
+        image_ir = np.array(Image.open(ir_path).convert('L')).astype(np.float32) / 255.0
+        image_vi = np.array(Image.open(vi_path).convert('RGB')).astype(np.float32) / 255.0
+        ir_tensor = torch.from_numpy(image_ir).unsqueeze(0)                  # [1,H,W]
+        vi_tensor = torch.from_numpy(image_vi).permute(2, 0, 1).contiguous() # [3,H,W]
+        samples.append((sample_id, ir_tensor, vi_tensor))
+    return samples
+
+
 def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1):
 
-    lr_start = 0.001
+    lr_start = 5e-4
     model_path = './model'
     model_path = os.path.join(model_path)
 
@@ -135,6 +155,13 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
     writer = SummaryWriter(log_dir=os.path.join(tb_root, exp_id))
     logger.info(f'Train start! Experiment: {exp_id}')
 
+    fixed_preview_samples = build_fixed_previews_from_train_path(TRAIN_PATH, PREVIEW_IMAGE_IDS)
+    found_ids = {sid for sid, _, _ in fixed_preview_samples}
+    missing_ids = PREVIEW_IMAGE_IDS - found_ids
+    logger.info(f"Fixed TRAIN_PATH previews found: {sorted(found_ids)}")
+    if missing_ids:
+        logger.info(f"Fixed TRAIN_PATH previews missing: {sorted(missing_ids)}")
+
     try:
         for epo in range(epoch):
             current_lr = optimizer.param_groups[0]['lr']
@@ -144,6 +171,7 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
                 'loss_grad': [],
                 'loss_l1': [],
                 'loss_ssim': [],
+                'loss_halo': [],
             }
             
             for it, (image_ir, image_vis) in enumerate(trainloader):
@@ -183,7 +211,7 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
                 optimizer.zero_grad()
 
 
-                loss_total, loss_grad, loss_l1, loss_ssim = train_loss(
+                loss_total, loss_grad, loss_l1, loss_ssim, loss_halo = train_loss(
                     image_ir, image_vis_ycrcb[:, 0:1, :, :], logits
                 )
                 # loss_total_adv, loss_mse_adv, loss_ssim_adv = train_loss(logits_adv, image_gt_ycbcr)
@@ -201,6 +229,7 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
                 epoch_loss_dict['loss_grad'].append(float(loss_grad.detach().cpu()))
                 epoch_loss_dict['loss_l1'].append(float(loss_l1.detach().cpu()))
                 epoch_loss_dict['loss_ssim'].append(float(loss_ssim.detach().cpu()))
+                epoch_loss_dict['loss_halo'].append(float(loss_halo.detach().cpu()))
                 
                 loss.backward()
                 
@@ -230,12 +259,14 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
                         f"(l1: {avg_loss_dict['loss_l1']:.4f}, "
                         f"grad: {avg_loss_dict['loss_grad']:.4f}, "
                         f"ssim: {avg_loss_dict['loss_ssim']:.4f}, "
+                        f"halo: {avg_loss_dict['loss_halo']:.4f}, "
                         f"LR: {current_lr:.6f})")
 
             writer.add_scalar('train/loss', avg_epoch_loss, epo + 1)
             writer.add_scalar('train/loss_grad', avg_loss_dict['loss_grad'], epo + 1)
             writer.add_scalar('train/loss_l1', avg_loss_dict['loss_l1'], epo + 1)
             writer.add_scalar('train/loss_ssim', avg_loss_dict['loss_ssim'], epo + 1)
+            writer.add_scalar('train/loss_halo', avg_loss_dict['loss_halo'], epo + 1)
             writer.add_scalar('train/lr', current_lr, epo + 1)
             writer.add_scalar('train/grad_norm', float(grad_norm), epo + 1)
 
@@ -256,10 +287,16 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
                     fused_clamped = fused.clamp(0, 1)
 
                     if tb_image_every > 0 and (epo % tb_image_every == 0) and it < 3:
-                        # MEF loss 不含掩膜，固定展示原始三图：VIS | IR | FusedRGB
-                        preview = make_preview_tensor(
-                            image_vis, image_ir, fused_clamped, image_vis_ycrcb
-                        )
+                        if PREVIEW_WITH_MASK:
+                            Mhard, Mhalo = train_loss.get_halo_masks(image_ir, image_vis_y)
+                            preview = make_preview_tensor(
+                                image_vis, image_ir, fused_clamped, image_vis_ycrcb,
+                                Mhard=Mhard, Mhalo=Mhalo
+                            )
+                        else:
+                            preview = make_preview_tensor(
+                                image_vis, image_ir, fused_clamped, image_vis_ycrcb
+                            )
                         writer.add_image(f'val/preview_{it}', preview, epo + 1)
                         
                         if it == 0:
@@ -288,6 +325,27 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
             writer.add_scalar('val/qabf', avg_qabf, epo + 1)
             writer.add_scalar('val/vif', avg_vif, epo + 1)
             writer.add_scalar('val/score', val_score, epo + 1)
+
+            # 固定样本预览（每个 epoch 同一组，来自 TRAIN_PATH）
+            if tb_image_every > 0 and (epo % tb_image_every == 0):
+                train_model.eval()
+                with torch.no_grad():
+                    for sample_id, ir_cpu, vis_cpu in fixed_preview_samples:
+                        image_ir = ir_cpu.unsqueeze(0).to(device)   # [1,1,H,W]
+                        image_vis = vis_cpu.unsqueeze(0).to(device) # [1,3,H,W]
+                        image_vis_ycrcb = RGB2YCrCb(image_vis)
+                        image_vis_y = image_vis_ycrcb[:, 0:1, :, :]
+                        fused = train_model(image_vis_y, image_ir).clamp(0, 1)
+
+                        if PREVIEW_WITH_MASK:
+                            Mhard, Mhalo = train_loss.get_halo_masks(image_ir, image_vis_y)
+                            preview = make_preview_tensor(
+                                image_vis, image_ir, fused, image_vis_ycrcb,
+                                Mhard=Mhard, Mhalo=Mhalo
+                            )
+                        else:
+                            preview = make_preview_tensor(image_vis, image_ir, fused, image_vis_ycrcb)
+                        writer.add_image(f'fixed_preview/{sample_id}', preview, epo + 1)
 
             # 根据验证指标更新学习率
             scheduler.step(val_score)
