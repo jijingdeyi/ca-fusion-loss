@@ -25,7 +25,7 @@ warnings.filterwarnings('ignore')
 # 在 TensorBoard 预览中展示 Mhard 与 Mhalo
 PREVIEW_WITH_MASK = True
 # 固定预览样本（来自 TRAIN_PATH，和 train/val 切分无关）
-PREVIEW_IMAGE_IDS = {"01185N", "01154N", "00326D", "00328D"}
+PREVIEW_IMAGE_IDS = {"00917N", "01185N", "01154N", "00326D", "00328D"}
 
 def seed_everything(seed=3407):
     os.environ['PYTHONHASHSEED'] = str(seed)
@@ -49,7 +49,7 @@ def seed_worker(worker_id):
 
 
 def make_preview_tensor(image_vis, image_ir, fused_y, image_vis_ycrcb=None,
-                        Mhard=None, Mhalo=None):
+                        Msoft=None, Mhard=None, Mhalo=None):
     """
     Create preview tensor with RGB images: [VIS | IR | FUSED_RGB]
     
@@ -88,11 +88,12 @@ def make_preview_tensor(image_vis, image_ir, fused_y, image_vis_ycrcb=None,
             m = m.repeat(3, 1, 1)               # [3, H, W]
         return m
 
-    if (Mhard is not None) and (Mhalo is not None):
+    if (Msoft is not None) and (Mhard is not None) and (Mhalo is not None):
+        Msoft_rgb = mask_to_rgb(Msoft)
         Mhard_rgb = mask_to_rgb(Mhard)
         Mhalo_rgb = mask_to_rgb(Mhalo)
-        # 按顺序拼接：IR | VIS | Mhard | Mhalo | FusedRGB
-        preview = torch.cat([ir, vis, Mhard_rgb, Mhalo_rgb, fused_rgb], dim=2)
+        # 按顺序拼接：IR | VIS | Msoft | Mhard | Mhalo | FusedRGB
+        preview = torch.cat([ir, vis, Msoft_rgb, Mhard_rgb, Mhalo_rgb, fused_rgb], dim=2)
     else:
         # 兼容旧逻辑：VIS | IR | FusedRGB
         preview = torch.cat([vis, ir, fused_rgb], dim=2)
@@ -288,10 +289,11 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
 
                     if tb_image_every > 0 and (epo % tb_image_every == 0) and it < 3:
                         if PREVIEW_WITH_MASK:
+                            Msoft, _ = train_loss.get_saliency_masks(image_ir)
                             Mhard, Mhalo = train_loss.get_halo_masks(image_ir, image_vis_y)
                             preview = make_preview_tensor(
                                 image_vis, image_ir, fused_clamped, image_vis_ycrcb,
-                                Mhard=Mhard, Mhalo=Mhalo
+                                Msoft=Msoft, Mhard=Mhard, Mhalo=Mhalo
                             )
                         else:
                             preview = make_preview_tensor(
@@ -338,10 +340,11 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
                         fused = train_model(image_vis_y, image_ir).clamp(0, 1)
 
                         if PREVIEW_WITH_MASK:
+                            Msoft, _ = train_loss.get_saliency_masks(image_ir)
                             Mhard, Mhalo = train_loss.get_halo_masks(image_ir, image_vis_y)
                             preview = make_preview_tensor(
                                 image_vis, image_ir, fused, image_vis_ycrcb,
-                                Mhard=Mhard, Mhalo=Mhalo
+                                Msoft=Msoft, Mhard=Mhard, Mhalo=Mhalo
                             )
                         else:
                             preview = make_preview_tensor(image_vis, image_ir, fused, image_vis_ycrcb)

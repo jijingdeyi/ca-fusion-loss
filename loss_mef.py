@@ -53,15 +53,17 @@ class L_Intensity(nn.Module):
     def __init__(self):
         super(L_Intensity, self).__init__()
 
-    def forward(self, image_A, image_B, image_fused):
-        intensity_joint = torch.max(image_A, image_B)
-        Loss_intensity = F.l1_loss(image_fused, intensity_joint)
+    def forward(self, image_fused, intensity_target):
+        Loss_intensity = F.l1_loss(image_fused, intensity_target)
         return Loss_intensity
 
 
 class fusion_loss_mef(nn.Module):
     def __init__(self,
                  blur_ks=9,
+                 mask_slope=20.0,
+                 thr_sigma=0.5,
+                 vis_brightness_thr=0.6,
                  ring_ks=3,
                  eta_halo=15.0,
                  delta_halo=0.5,
@@ -73,6 +75,9 @@ class fusion_loss_mef(nn.Module):
         self.L_Inten = L_Intensity()
         self.L_SSIM = L_SSIM()
         self.blur_ks = blur_ks
+        self.mask_slope = mask_slope
+        self.thr_sigma = thr_sigma
+        self.vis_brightness_thr = vis_brightness_thr
         self.ring_ks = ring_ks
         self.eta_halo = eta_halo
         self.delta_halo = delta_halo
@@ -86,14 +91,9 @@ class fusion_loss_mef(nn.Module):
     def _dilate(self, x):
         return F.max_pool2d(x, kernel_size=self.ring_ks, stride=1, padding=self.ring_ks // 2)
 
-    def get_halo_masks(self, image_A, image_B):
-        """Return M_hard and Mhalo for visualization.
-        image_A: IR, image_B: VIS-Y
-        """
+    def get_saliency_masks(self, image_A):
+        """Return M_soft and M_hard using loss.py-style multi-scale local contrast."""
         ir1 = image_A[:, :1, :, :]
-        ir_b = self._blur(ir1)
-        vis_b = self._blur(image_B[:, :1, :, :])
-
         window_sizes = [15, 31]
         S_multi = []
         for k in window_sizes:
@@ -103,8 +103,22 @@ class fusion_loss_mef(nn.Module):
 
         s_mean = S.mean(dim=[2, 3], keepdim=True)
         s_std = S.std(dim=[2, 3], keepdim=True) + 1e-6
+        thr_soft = s_mean + self.thr_sigma * s_std
+        M_soft = torch.sigmoid(self.mask_slope * (S - thr_soft))
+
         thr_hard = s_mean + 1.5 * s_std
         M_hard = ((S > thr_hard) & (ir1 > self.ir_brightness_thr)).float()
+        return M_soft, M_hard
+
+    def get_halo_masks(self, image_A, image_B):
+        """Return M_hard and Mhalo for visualization.
+        image_A: IR, image_B: VIS-Y
+        """
+        ir1 = image_A[:, :1, :, :]
+        ir_b = self._blur(ir1)
+        vis_b = self._blur(image_B[:, :1, :, :])
+
+        _, M_hard = self.get_saliency_masks(image_A)
 
         Mdil = self._dilate(M_hard)
         Mring = (Mdil - M_hard).clamp(0.0, 1.0)
@@ -114,7 +128,16 @@ class fusion_loss_mef(nn.Module):
 
     def forward(self, image_A, image_B, image_fused):
         # image_A: IR, image_B: VIS-Y, image_fused: fused-Y
-        loss_l1 = 20 * self.L_Inten(image_A, image_B, image_fused)
+        M_soft, _ = self.get_saliency_masks(image_A)
+        M_soft = M_soft.detach()
+
+        intensity_max = torch.max(image_A, image_B)
+        intensity_min = torch.min(image_A, image_B)
+        # In salient region, if VIS is already bright, use min target; otherwise keep max target.
+        salient_target = torch.where(image_B > self.vis_brightness_thr, intensity_min, intensity_max)
+        intensity_target = M_soft * salient_target + (1.0 - M_soft) * intensity_max
+
+        loss_l1 = 20 * self.L_Inten(image_fused, intensity_target)
         loss_gradient = 20 * self.L_Grad(image_A, image_B, image_fused)
         loss_SSIM = 10 * (1 - self.L_SSIM(image_A, image_B, image_fused))
 
