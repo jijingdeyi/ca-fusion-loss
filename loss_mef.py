@@ -60,21 +60,27 @@ class L_Intensity(nn.Module):
 
 class fusion_loss_mef(nn.Module):
     def __init__(self,
-                 blur_ks=9,
-                 mask_slope=20.0,
-                 vis_brightness_thr=0.6,
-                 ring_ks=3,
-                 eta_halo=15.0,
-                 delta_halo=0.5,
-                 eps_halo=0.04,
-                 lambda_halo=0.1):
+                 blur_ks=9,                   # 均值模糊核大小：用于 halo 分支中的 IR/VIS/fused 局部亮度比较
+                 mask_slope=20.0,             # M_soft 的 sigmoid 斜率：越大越“二值”，越小越平滑
+                 ir_brightness_thr=0.6,       # IR 亮度阈值：与 VIS 极亮条件联合，触发“强制取 max”
+                 vis_brightness_thr=0.6,      # VIS 亮度阈值：显著区内超过该阈值时倾向取 min(IR, VIS)
+                 vis_super_brightness_thr=0.9,  # VIS 极亮阈值：灯泡等高亮区域回退到 max(IR, VIS)
+                 vis_gate_quantile=0.8,       # VIS 分位数门控：用于过滤 M_hard，仅保留较亮 VIS 区域
+                 ring_ks=3,                   # ring 膨胀核大小：用于从 M_hard 生成环带 Mring
+                 eta_halo=15.0,               # halo sigmoid 斜率：控制 (vis_b-ir_b-delta) 到权重 h 的过渡陡峭程度
+                 delta_halo=0.5,              # halo 偏移量：提高该值会减少被判定为 halo 的区域
+                 eps_halo=0.04,               # halo 容忍边际：允许 fused_b 略高于 ir_b，超出部分才惩罚
+                 lambda_halo=0.1):            # halo 损失权重
         super(fusion_loss_mef, self).__init__()
         self.L_Grad = L_Grad()
         self.L_Inten = L_Intensity()
         self.L_SSIM = L_SSIM()
         self.blur_ks = blur_ks
         self.mask_slope = mask_slope
+        self.ir_brightness_thr = ir_brightness_thr
         self.vis_brightness_thr = vis_brightness_thr
+        self.vis_super_brightness_thr = vis_super_brightness_thr
+        self.vis_gate_quantile = vis_gate_quantile
         self.ring_ks = ring_ks
         self.eta_halo = eta_halo
         self.delta_halo = delta_halo
@@ -121,7 +127,7 @@ class fusion_loss_mef(nn.Module):
         S = torch.stack(S_multi, dim=0).max(dim=0)[0]
         S = S / (S.mean(dim=[2, 3], keepdim=True) + 1e-6)
 
-        p_soft = 0.10
+        p_soft = 0.03
         thr_soft = self._compute_quantile(S, 1.0 - p_soft)
         M_soft = torch.sigmoid(self.mask_slope * (S - thr_soft))
 
@@ -138,10 +144,13 @@ class fusion_loss_mef(nn.Module):
         image_A: IR, image_B: VIS-Y
         """
         ir1 = image_A[:, :1, :, :]
+        vis1 = image_B[:, :1, :, :]
         ir_b = self._blur(ir1)
-        vis_b = self._blur(image_B[:, :1, :, :])
+        vis_b = self._blur(vis1)
 
         _, M_hard = self.get_saliency_masks(image_A)
+        thr_vis = self._compute_quantile(vis1, self.vis_gate_quantile)
+        M_hard = (M_hard * (vis1 > thr_vis).float())
 
         Mdil = self._dilate(M_hard)
         Mring = (Mdil - M_hard).clamp(0.0, 1.0)
@@ -156,8 +165,13 @@ class fusion_loss_mef(nn.Module):
 
         intensity_max = torch.max(image_A, image_B)
         intensity_min = torch.min(image_A, image_B)
-        # In salient region, if VIS is already bright, use min target; otherwise keep max target.
-        salient_target = torch.where(image_B > self.vis_brightness_thr, intensity_min, intensity_max)
+        # In salient region, keep very bright VIS regions on max (e.g., lamps),
+        # otherwise use min when VIS is bright.
+        ir_bright = image_A > self.ir_brightness_thr
+        vis_bright = image_B > self.vis_brightness_thr
+        vis_super_bright = image_B > self.vis_super_brightness_thr
+        salient_target = torch.where(vis_bright, intensity_min, intensity_max)
+        salient_target = torch.where(vis_super_bright & ir_bright, intensity_max, salient_target)
         intensity_target = M_soft * salient_target + (1.0 - M_soft) * intensity_max
 
         loss_l1 = 20 * self.L_Inten(image_fused, intensity_target)
