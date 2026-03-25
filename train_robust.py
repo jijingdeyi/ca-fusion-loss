@@ -14,7 +14,14 @@ import warnings
 from rgb2ycbcr import RGB2YCrCb, YCrCb2RGB
 import random
 
-from metric import VIF_function, Qabf_function
+from metric import (
+    VIF_function,
+    Qabf_function,
+    MI_function,
+    SCD_function,
+    SSIM_function,
+    composite_validation_score,
+)
 
 
 import numpy as np
@@ -273,8 +280,11 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
 
             # 验证阶段
             train_model.eval()
+            total_mi = 0.0
             total_qabf = 0.0
+            total_scd = 0.0
             total_vif = 0.0
+            total_ssim = 0.0
             val_count = 0
             
             with torch.no_grad():
@@ -310,22 +320,43 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
                     image_vis_y_np = (image_vis_y.squeeze().cpu().numpy() * 255.0).astype(np.float32)
                     fused_np = (fused_clamped.squeeze().cpu().numpy() * 255.0).astype(np.float32)
                     
+                    mi = MI_function(image_ir_np, image_vis_y_np, fused_np)
                     qabf = Qabf_function(image_ir_np, image_vis_y_np, fused_np)
+                    scd = SCD_function(image_ir_np, image_vis_y_np, fused_np)
                     vif = VIF_function(image_ir_np, image_vis_y_np, fused_np)
+                    ssim_val = SSIM_function(image_ir_np, image_vis_y_np, fused_np)
 
+                    total_mi += mi
                     total_qabf += qabf
+                    total_scd += scd
                     total_vif += vif
+                    total_ssim += ssim_val
                     val_count += 1
 
-            # 计算平均指标
+            # 验证集上五项指标的原始均值，再按经验范围归一化后平均得到 val_score
+            avg_mi = total_mi / val_count
             avg_qabf = total_qabf / val_count
+            avg_scd = total_scd / val_count
             avg_vif = total_vif / val_count
-            val_score = avg_qabf + 0.5 * avg_vif
+            avg_ssim = total_ssim / val_count
+            val_score = composite_validation_score(
+                avg_mi, avg_qabf, avg_scd, avg_vif, avg_ssim
+            )
 
-            logger.info(f"Epoch {epo}: val_qabf={avg_qabf:.4f}, val_vif={avg_vif:.4f}, val_score={val_score:.4f}")
+            logger.info(
+                f"Epoch {epo + 1} val raw metrics — "
+                f"mi={avg_mi:.6f}, qabf={avg_qabf:.6f}, scd={avg_scd:.6f}, "
+                f"vif={avg_vif:.6f}, ssim={avg_ssim:.6f}"
+            )
+            logger.info(
+                f"Epoch {epo + 1} val_score (normalized mean of five)={val_score:.6f}"
+            )
 
+            writer.add_scalar('val/mi', avg_mi, epo + 1)
             writer.add_scalar('val/qabf', avg_qabf, epo + 1)
+            writer.add_scalar('val/scd', avg_scd, epo + 1)
             writer.add_scalar('val/vif', avg_vif, epo + 1)
+            writer.add_scalar('val/ssim', avg_ssim, epo + 1)
             writer.add_scalar('val/score', val_score, epo + 1)
 
             # 固定样本预览（每个 epoch 同一组，来自 TRAIN_PATH）

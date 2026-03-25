@@ -6,6 +6,35 @@ import math
 import torch
 from pytorch_msssim import ssim, ms_ssim
 
+# 验证综合分数：各指标原始值的经验范围（用于线性归一化到 [0,1] 后取平均）
+
+VAL_METRIC_RANGES = {
+    'mi':   (1.5, 6.5),
+    'scd':  (1.0, 1.9),
+    'vif':  (0.4, 1.2),
+    'ssim': (0.5, 0.85),
+    'qabf': (0.1, 0.8),
+}
+
+
+def composite_validation_score(
+    mi: float, qabf: float, scd: float, vif: float, ssim_score: float
+) -> float:
+    """
+    对五个原始指标做线性归一化并 clip 到 [0,1]，再取算术平均作为验证 Score。
+    """
+    keys = ("mi", "qabf", "scd", "vif", "ssim")
+    raw = (mi, qabf, scd, vif, ssim_score)
+    normed = []
+    for key, m in zip(keys, raw):
+        lo, hi = VAL_METRIC_RANGES[key]
+        if hi <= lo:
+            normed.append(0.0)
+            continue
+        x = (m - lo) / (hi - lo)
+        normed.append(float(np.clip(x, 0.0, 1.0)))
+    return float(sum(normed) / len(normed))
+
 
 def EN_function(image_array):
     # 计算图像的直方图
@@ -151,9 +180,14 @@ def Qabf_function(A, B, F):
     return get_Qabf(A, B, F)
 
 
-def Hab(im1, im2, gray_level):
+def Hab(im1, im2, gray_level, use_nats=True):
+    """
+    计算两幅图像之间的互信息。use_nats=True 用 ln（与 /cv-rookie/Metric/metric.py 一致），False 用 log2。
+    """
+    im1 = np.clip(np.asarray(im1, dtype=np.int32), 0, gray_level - 1)
+    im2 = np.clip(np.asarray(im2, dtype=np.int32), 0, gray_level - 1)
+    log_fn = np.log if use_nats else lambda p: math.log2(p)
     hang, lie = im1.shape
-    count = hang * lie
     N = gray_level
     h = np.zeros((N, N))
     for i in range(hang):
@@ -162,28 +196,28 @@ def Hab(im1, im2, gray_level):
     h = h / np.sum(h)
     im1_marg = np.sum(h, axis=0)
     im2_marg = np.sum(h, axis=1)
-    H_x = 0
-    H_y = 0
+    H_x = 0.0
+    H_y = 0.0
     for i in range(N):
         if im1_marg[i] != 0:
-            H_x = H_x + im1_marg[i] * math.log2(im1_marg[i])
+            H_x = H_x + im1_marg[i] * log_fn(im1_marg[i])
     for i in range(N):
         if im2_marg[i] != 0:
-            H_x = H_x + im2_marg[i] * math.log2(im2_marg[i])
-    H_xy = 0
+            H_y = H_y + im2_marg[i] * log_fn(im2_marg[i])
+    H_xy = 0.0
     for i in range(N):
         for j in range(N):
             if h[i, j] != 0:
-                H_xy = H_xy + h[i, j] * math.log2(h[i, j])
+                H_xy = H_xy + h[i, j] * log_fn(h[i, j])
     MI = H_xy - H_x - H_y
-    return MI
+    return float(MI)
 
 
-def MI_function(A, B, F, gray_level=256):
-    MIA = Hab(A, F, gray_level)
-    MIB = Hab(B, F, gray_level)
-    MI_results = MIA + MIB
-    return MI_results
+def MI_function(A, B, F, gray_level=256, use_nats=True):
+    """融合质量 MI：MI(A,F) + MI(B,F)。use_nats=True 与 cv-rookie 实现一致（自然对数）。"""
+    MIA = Hab(A, F, gray_level, use_nats=use_nats)
+    MIB = Hab(B, F, gray_level, use_nats=use_nats)
+    return MIA + MIB
 
 
 def AG_function(image):

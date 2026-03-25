@@ -63,7 +63,7 @@ class fusion_loss_mef(nn.Module):
                  blur_ks=9,                   # 均值模糊核大小：用于 halo 分支中的 IR/VIS/fused 局部亮度比较
                  mask_slope=20.0,             # M_soft 的 sigmoid 斜率：越大越“二值”，越小越平滑
                  ir_brightness_thr=0.6,       # IR 亮度阈值：与 VIS 极亮条件联合，触发“强制取 max”
-                 vis_brightness_thr=0.6,      # VIS 亮度阈值：显著区内超过该阈值时倾向取 min(IR, VIS)
+                 vis_brightness_thr=0.4,      # VIS 亮度阈值：显著区内超过该阈值时倾向取 min(IR, VIS)
                  vis_super_brightness_thr=0.9,  # VIS 极亮阈值：灯泡等高亮区域回退到 max(IR, VIS)
                  vis_gate_quantile=0.8,       # VIS 分位数门控：用于过滤 M_hard，仅保留较亮 VIS 区域
                  ring_ks=3,                   # ring 膨胀核大小：用于从 M_hard 生成环带 Mring
