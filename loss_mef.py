@@ -69,8 +69,10 @@ class fusion_loss_mef(nn.Module):
                  ring_ks=3,                   # ring 膨胀核大小：用于从 M_hard 生成环带 Mring
                  eta_halo=15.0,               # halo sigmoid 斜率：控制 (vis_b-ir_b-delta) 到权重 h 的过渡陡峭程度
                  delta_halo=0.5,              # halo 偏移量：提高该值会减少被判定为 halo 的区域
+                 eps_bloom=0.02,              # bloom 容忍边际：fused_b 超过 ir_b+eps_bloom 的部分受罚
                  eps_halo=0.04,               # halo 容忍边际：允许 fused_b 略高于 ir_b，超出部分才惩罚
-                 lambda_halo=0.1):            # halo 损失权重
+                 lambda_halo=0.1,             # halo 损失权重
+                 lambda_bloom=0.2):           # bloom 损失权重（轻约束）
         super(fusion_loss_mef, self).__init__()
         self.L_Grad = L_Grad()
         self.L_Inten = L_Intensity()
@@ -84,8 +86,10 @@ class fusion_loss_mef(nn.Module):
         self.ring_ks = ring_ks
         self.eta_halo = eta_halo
         self.delta_halo = delta_halo
+        self.eps_bloom = eps_bloom
         self.eps_halo = eps_halo
         self.lambda_halo = lambda_halo
+        self.lambda_bloom = lambda_bloom
 
     def _blur(self, x):
         return F.avg_pool2d(x, self.blur_ks, stride=1, padding=self.blur_ks // 2)
@@ -190,5 +194,12 @@ class fusion_loss_mef(nn.Module):
         sum_mhalo = (Mhalo.sum() + 1e-6).clamp(min=1.0)
         loss_halo = (Mhalo * F.relu(fused_b - (ir_b + self.eps_halo))).sum() / sum_mhalo
 
-        fusion_loss = loss_l1 + loss_gradient + loss_SSIM + self.lambda_halo * loss_halo
-        return fusion_loss, loss_gradient, loss_l1, loss_SSIM, self.lambda_halo * loss_halo
+        # Bloom loss: in salient IR regions, suppress fused local brightness overflow.
+        sum_msoft = (M_soft.sum() + 1e-6).clamp(min=1.0)
+        loss_bloom = (M_soft * F.relu(fused_b - (ir_b + self.eps_bloom))).sum() / sum_msoft
+
+        weighted_halo = self.lambda_halo * loss_halo
+        weighted_bloom = self.lambda_bloom * loss_bloom
+        fusion_loss = loss_l1 + loss_gradient + loss_SSIM + weighted_halo + weighted_bloom
+        # Keep training script interface unchanged; the last term now reflects total anti-halo regularization.
+        return fusion_loss, loss_gradient, loss_l1, loss_SSIM, (weighted_halo + weighted_bloom)

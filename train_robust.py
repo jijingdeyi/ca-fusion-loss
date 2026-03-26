@@ -150,7 +150,7 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
 
     st = glob_st = time.time()
     val_best_score = 0.0
-    patience_max = 5
+    patience_max = 10
     patience = 0
     
     # 生成实验ID（用于区分不同实验）
