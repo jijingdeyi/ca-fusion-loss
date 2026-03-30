@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from pytorch_msssim import ssim
+from loss_halo import PhysicsConsistentHaloMask
 
 
 class Sobelxy(nn.Module):
@@ -61,41 +62,27 @@ class L_Intensity(nn.Module):
 class fusion_loss_mef(nn.Module):
     def __init__(self,
                  blur_ks=9,                   # 均值模糊核大小：用于 halo 分支中的 IR/VIS/fused 局部亮度比较
-                 mask_slope=20.0,             # M_soft 的 sigmoid 斜率：越大越“二值”，越小越平滑
-                 ir_brightness_thr=0.6,       # IR 亮度阈值：与 VIS 极亮条件联合，触发“强制取 max”
-                 vis_brightness_thr=0.4,      # VIS 亮度阈值：显著区内超过该阈值时倾向取 min(IR, VIS)
-                 vis_super_brightness_thr=0.9,  # VIS 极亮阈值：灯泡等高亮区域回退到 max(IR, VIS)
-                 vis_gate_quantile=0.8,       # VIS 分位数门控：用于过滤 M_hard，仅保留较亮 VIS 区域
-                 ring_ks=3,                   # ring 膨胀核大小：用于从 M_hard 生成环带 Mring
-                 eta_halo=15.0,               # halo sigmoid 斜率：控制 (vis_b-ir_b-delta) 到权重 h 的过渡陡峭程度
-                 delta_halo=0.5,              # halo 偏移量：提高该值会减少被判定为 halo 的区域
-                 eps_bloom=0.02,              # bloom 容忍边际：fused_b 超过 ir_b+eps_bloom 的部分受罚
-                 eps_halo=0.04,               # halo 容忍边际：允许 fused_b 略高于 ir_b，超出部分才惩罚
-                 lambda_halo=0.1,             # halo 损失权重
-                 lambda_bloom=0.2):           # bloom 损失权重（轻约束）
+                 lambda_halo=0.3,             # halo 损失权重（由 0.1 上调）
+                 lambda_bloom=0.6,           # bloom 损失权重（由 0.2 上调）
+                 w_l1=15.0,                   # L1 主损失权重（由 20 下调，降低主导性）
+                 w_grad=14.0,                 # 梯度损失权重（由 20 下调，避免压制其他分支）
+                 w_ssim=20.0):                # SSIM 损失权重（由 10 上调，提升结构约束）
         super(fusion_loss_mef, self).__init__()
         self.L_Grad = L_Grad()
         self.L_Inten = L_Intensity()
         self.L_SSIM = L_SSIM()
         self.blur_ks = blur_ks
-        self.mask_slope = mask_slope
-        self.ir_brightness_thr = ir_brightness_thr
-        self.vis_brightness_thr = vis_brightness_thr
-        self.vis_super_brightness_thr = vis_super_brightness_thr
-        self.vis_gate_quantile = vis_gate_quantile
-        self.ring_ks = ring_ks
-        self.eta_halo = eta_halo
-        self.delta_halo = delta_halo
-        self.eps_bloom = eps_bloom
-        self.eps_halo = eps_halo
+        self.halo_mask_builder = PhysicsConsistentHaloMask()
+        self.eta_halo = 15.0  # halo sigmoid 斜率：控制 (vis_b-ir_b-delta) 到权重 h 的过渡陡峭程度
+        self.delta_halo = 0.5  # halo 偏移量：提高该值会减少被判定为 halo 的区域
         self.lambda_halo = lambda_halo
         self.lambda_bloom = lambda_bloom
+        self.w_l1 = w_l1
+        self.w_grad = w_grad
+        self.w_ssim = w_ssim
 
     def _blur(self, x):
         return F.avg_pool2d(x, self.blur_ks, stride=1, padding=self.blur_ks // 2)
-
-    def _dilate(self, x):
-        return F.max_pool2d(x, kernel_size=self.ring_ks, stride=1, padding=self.ring_ks // 2)
 
     @staticmethod
     def _erode(x, k):
@@ -115,88 +102,129 @@ class fusion_loss_mef(nn.Module):
         q_val = torch.quantile(x_flat, q, dim=1, keepdim=True)
         return q_val.view(B, 1, 1, 1)
 
-    def get_saliency_masks(self, image_A):
-        """Return M_soft and M_hard using multi-scale Top-hat + quantile thresholds."""
+    def build_distance_decay(self, M_light, near_radius=50):
+        """
+        Build a simple binary template:
+        near M_light -> 1, far from M_light -> 0.
+        """
+        near_radius = int(max(1, near_radius))
+        ks = 2 * near_radius + 1
+
+        coords = torch.arange(-near_radius, near_radius + 1, device=M_light.device)
+        yy, xx = torch.meshgrid(coords, coords, indexing="ij")
+        disk = ((xx * xx + yy * yy) <= (near_radius * near_radius)).to(M_light.dtype)
+        disk_kernel = disk.view(1, 1, ks, ks)
+
+        near_score = F.conv2d((M_light > 0).to(M_light.dtype), disk_kernel, padding=near_radius)
+        return (near_score > 0).to(M_light.dtype)
+
+    def _compute_saliency(self, image_A):
+        """Compute shared saliency map from IR image."""
         ir1 = image_A[:, :1, :, :]
         kernel_sizes = [9, 15, 31]
 
-        S_multi = []
+        saliency_scales = []
         for k in kernel_sizes:
-            if k % 2 == 0:
-                raise ValueError(f"Kernel size must be odd, got {k}")
             opened = self._opening(ir1, k)
-            S_k = ir1 - opened  # Top-hat
-            S_multi.append(S_k)
+            saliency_k = ir1 - opened  # Top-hat
+            saliency_scales.append(saliency_k)
 
-        S = torch.stack(S_multi, dim=0).max(dim=0)[0]
-        S = S / (S.mean(dim=[2, 3], keepdim=True) + 1e-6)
+        saliency = torch.stack(saliency_scales, dim=0).max(dim=0)[0]
+        saliency = saliency / (saliency.mean(dim=[2, 3], keepdim=True) + 1e-6)
+        return saliency, ir1
 
-        p_soft = 0.03
-        thr_soft = self._compute_quantile(S, 1.0 - p_soft)
-        M_soft = torch.sigmoid(self.mask_slope * (S - thr_soft))
+    def get_M_mask(self, image_A):
+        saliency, _ = self._compute_saliency(image_A)
+        mask_slope = 20.0
 
-        p_hard = 0.03
-        thr_hard = self._compute_quantile(S, 1.0 - p_hard)
+        top_ratio_m = 0.1
+        thr_m = self._compute_quantile(saliency, 1.0 - top_ratio_m)
+        M = torch.sigmoid(mask_slope * (saliency - thr_m))
+        return M
 
-        q_bright = 0.8
-        thr_bright = self._compute_quantile(ir1, q_bright)
-        M_hard = ((S > thr_hard) & (ir1 > thr_bright)).float()
-        return M_soft, M_hard
+    def get_M_light_base_mask(self, image_A):
+        saliency, ir1 = self._compute_saliency(image_A)
+        ir_gate_quantile = 0.97
 
-    def get_halo_masks(self, image_A, image_B):
-        """Return M_hard and Mhalo for visualization.
-        image_A: IR, image_B: VIS-Y
-        """
-        ir1 = image_A[:, :1, :, :]
+        top_ratio_light = 0.03
+        thr_m_light = self._compute_quantile(saliency, 1.0 - top_ratio_light)
+
+        thr_ir_bright = self._compute_quantile(ir1, ir_gate_quantile)
+        M_light = ((saliency > thr_m_light) & (ir1 > thr_ir_bright)).float()  # 显著性大并且红外亮度大
+        return M_light
+
+    def get_M_light_mask(self, image_A, image_B):
         vis1 = image_B[:, :1, :, :]
-        ir_b = self._blur(ir1)
-        vis_b = self._blur(vis1)
+        M_light = self.get_M_light_base_mask(image_A)
+        light_gate_quantile = 0.97
 
-        _, M_hard = self.get_saliency_masks(image_A)
-        thr_vis = self._compute_quantile(vis1, self.vis_gate_quantile)
-        M_hard = (M_hard * (vis1 > thr_vis).float())
+        thr_vis_super = self._compute_quantile(vis1, light_gate_quantile)
+        M_light = (M_light * (vis1 > thr_vis_super).float())  # 显著性大并且红外亮度大且可见光亮度大，潜在灯泡区域
+        return M_light
 
-        Mdil = self._dilate(M_hard)
-        Mring = (Mdil - M_hard).clamp(0.0, 1.0)
-        h = torch.sigmoid(self.eta_halo * (vis_b - ir_b - self.delta_halo))
-        Mhalo = Mring * h
-        return M_hard, Mhalo
+    def get_M_halo_mask(self, image_A, image_B):
+        ir1 = image_A[:, :1, :, :]
+        M_light = self.get_M_light_mask(image_A, image_B)
+
+        # Use halo mask from loss_halo.py (some versions return tensor, others return tuple)
+        halo_out = self.halo_mask_builder(ir1, image_B[:, :1, :, :])
+        if isinstance(halo_out, tuple):
+            halo_out = halo_out[0]
+
+        # Remove the light core itself from halo candidate.
+        Mhalo = torch.clamp(halo_out - M_light, 0, 1)
+
+        # Step3: 空间衰减（平滑）
+        decay = self.build_distance_decay(M_light)
+
+        # Final
+        Mhalo = Mhalo * decay
+        return Mhalo
 
     def forward(self, image_A, image_B, image_fused):
         # image_A: IR, image_B: VIS-Y, image_fused: fused-Y
-        M_soft, _ = self.get_saliency_masks(image_A)
-        M_soft = M_soft.detach()
+        M = self.get_M_mask(image_A)
+        M_light = self.get_M_light_mask(image_A, image_B)
+        M = M.detach()
+        M_light = M_light.detach()
 
         intensity_max = torch.max(image_A, image_B)
         intensity_min = torch.min(image_A, image_B)
-        # In salient region, keep very bright VIS regions on max (e.g., lamps),
-        # otherwise use min when VIS is bright.
-        ir_bright = image_A > self.ir_brightness_thr
-        vis_bright = image_B > self.vis_brightness_thr
-        vis_super_bright = image_B > self.vis_super_brightness_thr
+        # 如果红外亮，可见光也亮，说明目标照明良好，压制亮度
+        # 如果红外亮，可见光极亮，说明很可能是灯泡，最大亮度
+        ir_gate_quantile = 0.7
+        vis_gate_quantile = 0.4
+        light_gate_quantile = 0.85
+        thr_ir = self._compute_quantile(image_A, ir_gate_quantile).clamp(0.45, 0.85)
+        thr_vis = self._compute_quantile(image_B, vis_gate_quantile).clamp(0.30, 0.70)
+        thr_vis_super = self._compute_quantile(image_B, light_gate_quantile).clamp(0.75, 0.98)
+
+        ir_bright = image_A > thr_ir
+        vis_bright = image_B > thr_vis
+        vis_super_bright = image_B > thr_vis_super
         salient_target = torch.where(vis_bright, intensity_min, intensity_max)
         salient_target = torch.where(vis_super_bright & ir_bright, intensity_max, salient_target)
-        intensity_target = M_soft * salient_target + (1.0 - M_soft) * intensity_max
+        intensity_target = M * salient_target + (1.0 - M) * intensity_max
 
-        loss_l1 = 20 * self.L_Inten(image_fused, intensity_target)
-        loss_gradient = 20 * self.L_Grad(image_A, image_B, image_fused)
-        loss_SSIM = 10 * (1 - self.L_SSIM(image_A, image_B, image_fused))
+        loss_l1 = self.w_l1 * self.L_Inten(image_fused, intensity_target)
+        loss_gradient = self.w_grad * self.L_Grad(image_A, image_B, image_fused)
+        loss_SSIM = self.w_ssim * (1 - self.L_SSIM(image_A, image_B, image_fused))
 
         # Halo loss branch (adapted from loss.py)
         ir_b = self._blur(image_A[:, :1, :, :])
         vis_b = self._blur(image_B[:, :1, :, :])
         fused_b = self._blur(image_fused[:, :1, :, :]).clamp(0, 1)
 
-        M_hard, Mhalo = self.get_halo_masks(image_A, image_B)
-        M_hard = M_hard.detach()
+        Mhalo = self.get_M_halo_mask(image_A, image_B)
         Mhalo = Mhalo.detach()
 
+        # Halo loss: penalize fused brightness exceeding IR brightness in halo regions
         sum_mhalo = (Mhalo.sum() + 1e-6).clamp(min=1.0)
-        loss_halo = (Mhalo * F.relu(fused_b - (ir_b + self.eps_halo))).sum() / sum_mhalo
+        loss_halo = (Mhalo * F.relu(fused_b - ir_b)).sum() / sum_mhalo
 
-        # Bloom loss: in salient IR regions, suppress fused local brightness overflow.
-        sum_msoft = (M_soft.sum() + 1e-6).clamp(min=1.0)
-        loss_bloom = (M_soft * F.relu(fused_b - (ir_b + self.eps_bloom))).sum() / sum_msoft
+        # Bloom loss: constrain fused brightness to match visible brightness in M regions (salient targets)
+        sum_m = (M.sum() + 1e-6).clamp(min=1.0)
+        loss_bloom = (M * F.relu(fused_b - vis_b)).sum() / sum_m
 
         weighted_halo = self.lambda_halo * loss_halo
         weighted_bloom = self.lambda_bloom * loss_bloom

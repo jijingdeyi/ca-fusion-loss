@@ -29,7 +29,7 @@ from PIL import Image
 
 warnings.filterwarnings('ignore')
 
-# 在 TensorBoard 预览中展示 Mhard 与 Mhalo
+# 在 TensorBoard 预览中展示 M、M_light 与 Mhalo
 PREVIEW_WITH_MASK = True
 # 固定预览样本（来自 TRAIN_PATH，和 train/val 切分无关）
 PREVIEW_IMAGE_IDS = {"00917N", "01185N", "01154N", "00326D", "00328D"}
@@ -56,7 +56,7 @@ def seed_worker(worker_id):
 
 
 def make_preview_tensor(image_vis, image_ir, fused_y, image_vis_ycrcb=None,
-                        Msoft=None, Mhard=None, Mhalo=None):
+                        M=None, M_light=None, Mhalo=None):
     """
     Create preview tensor with RGB images: [VIS | IR | FUSED_RGB]
     
@@ -95,12 +95,12 @@ def make_preview_tensor(image_vis, image_ir, fused_y, image_vis_ycrcb=None,
             m = m.repeat(3, 1, 1)               # [3, H, W]
         return m
 
-    if (Msoft is not None) and (Mhard is not None) and (Mhalo is not None):
-        Msoft_rgb = mask_to_rgb(Msoft)
-        Mhard_rgb = mask_to_rgb(Mhard)
+    if (M is not None) and (M_light is not None) and (Mhalo is not None):
+        M_rgb = mask_to_rgb(M)
+        M_light_rgb = mask_to_rgb(M_light)
         Mhalo_rgb = mask_to_rgb(Mhalo)
-        # 按顺序拼接：IR | VIS | Msoft | Mhard | Mhalo | FusedRGB
-        preview = torch.cat([ir, vis, Msoft_rgb, Mhard_rgb, Mhalo_rgb, fused_rgb], dim=2)
+        # 按顺序拼接：IR | VIS | M | M_light | Mhalo | FusedRGB
+        preview = torch.cat([ir, vis, M_rgb, M_light_rgb, Mhalo_rgb, fused_rgb], dim=2)
     else:
         # 兼容旧逻辑：VIS | IR | FusedRGB
         preview = torch.cat([vis, ir, fused_rgb], dim=2)
@@ -144,7 +144,13 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
         optimizer, mode='max', factor=0.75, patience=2, min_lr=1e-6
     )
 
-    train_loss = fusion_loss_mef()
+    train_loss = fusion_loss_mef(
+        w_l1=15.0,
+        w_grad=14.0,
+        w_ssim=20.0,
+        lambda_halo=0.2,
+        lambda_bloom=0.35,
+    )
     train_loss.to(device)  
     epoch = 50
 
@@ -299,11 +305,12 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
 
                     if tb_image_every > 0 and (epo % tb_image_every == 0) and it < 3:
                         if PREVIEW_WITH_MASK:
-                            Msoft, _ = train_loss.get_saliency_masks(image_ir)
-                            Mhard, Mhalo = train_loss.get_halo_masks(image_ir, image_vis_y)
+                            M = train_loss.get_M_mask(image_ir)
+                            M_light = train_loss.get_M_light_mask(image_ir, image_vis_y)
+                            Mhalo = train_loss.get_M_halo_mask(image_ir, image_vis_y)
                             preview = make_preview_tensor(
                                 image_vis, image_ir, fused_clamped, image_vis_ycrcb,
-                                Msoft=Msoft, Mhard=Mhard, Mhalo=Mhalo
+                                M=M, M_light=M_light, Mhalo=Mhalo
                             )
                         else:
                             preview = make_preview_tensor(
@@ -371,11 +378,12 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
                         fused = train_model(image_vis_y, image_ir).clamp(0, 1)
 
                         if PREVIEW_WITH_MASK:
-                            Msoft, _ = train_loss.get_saliency_masks(image_ir)
-                            Mhard, Mhalo = train_loss.get_halo_masks(image_ir, image_vis_y)
+                            M = train_loss.get_M_mask(image_ir)
+                            M_light = train_loss.get_M_light_mask(image_ir, image_vis_y)
+                            Mhalo = train_loss.get_M_halo_mask(image_ir, image_vis_y)
                             preview = make_preview_tensor(
                                 image_vis, image_ir, fused, image_vis_ycrcb,
-                                Msoft=Msoft, Mhard=Mhard, Mhalo=Mhalo
+                                M=M, M_light=M_light, Mhalo=Mhalo
                             )
                         else:
                             preview = make_preview_tensor(image_vis, image_ir, fused, image_vis_ycrcb)
