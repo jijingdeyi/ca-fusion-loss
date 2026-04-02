@@ -7,12 +7,13 @@ import logging
 import os
 import glob
 from logger import setup_logger
-from loss_mef import fusion_loss_mef
+from loss_v3 import fusion_loss_mef
 import torch
 from torch.utils.tensorboard import SummaryWriter
 import warnings
 from rgb2ycbcr import RGB2YCrCb, YCrCb2RGB
 import random
+import itertools
 
 from metric import (
     VIF_function,
@@ -29,7 +30,7 @@ from PIL import Image
 
 warnings.filterwarnings('ignore')
 
-# 在 TensorBoard 预览中展示 M、M_light 与 Mhalo
+# 在 TensorBoard 预览中展示 Mbloom 与 Mhalo
 PREVIEW_WITH_MASK = True
 # 固定预览样本（来自 TRAIN_PATH，和 train/val 切分无关）
 PREVIEW_IMAGE_IDS = {"00917N", "01185N", "01154N", "00326D", "00328D"}
@@ -56,7 +57,7 @@ def seed_worker(worker_id):
 
 
 def make_preview_tensor(image_vis, image_ir, fused_y, image_vis_ycrcb=None,
-                        M=None, M_light=None, Mhalo=None):
+                        Mbloom=None, Mhalo=None):
     """
     Create preview tensor with RGB images: [VIS | IR | FUSED_RGB]
     
@@ -95,12 +96,11 @@ def make_preview_tensor(image_vis, image_ir, fused_y, image_vis_ycrcb=None,
             m = m.repeat(3, 1, 1)               # [3, H, W]
         return m
 
-    if (M is not None) and (M_light is not None) and (Mhalo is not None):
-        M_rgb = mask_to_rgb(M)
-        M_light_rgb = mask_to_rgb(M_light)
+    if (Mbloom is not None) and (Mhalo is not None):
+        Mbloom_rgb = mask_to_rgb(Mbloom)
         Mhalo_rgb = mask_to_rgb(Mhalo)
-        # 按顺序拼接：IR | VIS | M | M_light | Mhalo | FusedRGB
-        preview = torch.cat([ir, vis, M_rgb, M_light_rgb, Mhalo_rgb, fused_rgb], dim=2)
+        # 按顺序拼接：IR | VIS | Mbloom | Mhalo | FusedRGB
+        preview = torch.cat([ir, vis, Mbloom_rgb, Mhalo_rgb, fused_rgb], dim=2)
     else:
         # 兼容旧逻辑：VIS | IR | FusedRGB
         preview = torch.cat([vis, ir, fused_rgb], dim=2)
@@ -125,11 +125,12 @@ def build_fixed_previews_from_train_path(train_path, preview_ids):
     return samples
 
 
-def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1):
+def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1, lambda_freeze_epochs=10):
 
     lr_start = 5e-4
     model_path = './model'
     model_path = os.path.join(model_path)
+    os.makedirs(model_path, exist_ok=True)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
@@ -138,36 +139,58 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
     # init_weights(train_model)
     train_model.train()
 
-    optimizer = torch.optim.Adam(train_model.parameters(), lr=lr_start)
-
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.75, patience=2, min_lr=1e-6
-    )
-
     train_loss = fusion_loss_mef(
         w_l1=15.0,
         w_grad=14.0,
         w_ssim=20.0,
-        lambda_halo=0.2,
-        lambda_bloom=0.35,
+        halo_bins=(0.90, 0.95, 0.98, 1.00),
+        bloom_bins=(0.90, 0.95, 0.98, 1.00),
+        lambda_halo_init=(0.35, 0.50, 0.70),
+        lambda_bloom_init=(0.35, 0.35, 0.35),
+        lambda_min=0.10,
     )
     train_loss.to(device)  
-    epoch = 50
+
+    optimizer = torch.optim.Adam(
+        itertools.chain(
+            train_model.parameters(),
+            [train_loss.lambda_halo_raw, train_loss.lambda_bloom_raw]
+        ),
+        lr=lr_start
+    )
+
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.75, patience=2, min_lr=1e-6
+    )
+    epoch = 100
 
     st = glob_st = time.time()
     val_best_score = 0.0
     patience_max = 10
     patience = 0
     
-    # 生成实验ID（用于区分不同实验）
+    # 生成实验ID（用于统一日志、tensorboard 与模型命名）
     if exp_name is None:
         exp_id = time.strftime("%Y%m%d-%H%M%S")
     else:
-        exp_id = f"{exp_name}-{time.strftime('%Y%m%d-%H%M%S')}"
-    best_model_name = f'A2RNet-{exp_id}-best.pth'
-    best_model_path = os.path.join(model_path, best_model_name)
-    writer = SummaryWriter(log_dir=os.path.join(tb_root, exp_id))
+        exp_id = exp_name
+    best_model_path = None
+    tb_log_dir = os.path.join(os.path.abspath(tb_root), exp_id)
+    os.makedirs(tb_log_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=tb_log_dir)
     logger.info(f'Train start! Experiment: {exp_id}')
+    with torch.no_grad():
+        halo_l = train_loss.get_lambda_halo().detach().cpu().tolist()
+        bloom_l = train_loss.get_lambda_bloom().detach().cpu().tolist()
+    logger.info(
+        "Loss config => w_l1=%.2f, w_grad=%.2f, w_ssim=%.2f, halo_bins=%s, bloom_bins=%s, "
+        "lambda_halo_init=%s, lambda_bloom_init=%s, lambda_min=%.2f, lambda_freeze_epochs=%d",
+        train_loss.w_l1, train_loss.w_grad, train_loss.w_ssim,
+        train_loss.halo_bins, train_loss.bloom_bins,
+        [round(v, 4) for v in halo_l], [round(v, 4) for v in bloom_l], train_loss.lambda_min,
+        lambda_freeze_epochs
+    )
+    logger.info("Base loss weights are fixed constants: w_l1/w_grad/w_ssim are not learnable.")
 
     fixed_preview_samples = build_fixed_previews_from_train_path(TRAIN_PATH, PREVIEW_IMAGE_IDS)
     found_ids = {sid for sid, _, _ in fixed_preview_samples}
@@ -178,6 +201,22 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
 
     try:
         for epo in range(epoch):
+            if epo == 0:
+                train_loss.lambda_halo_raw.requires_grad_(False)
+                train_loss.lambda_bloom_raw.requires_grad_(False)
+                logger.info(
+                    f"Lambda learning is frozen for first {lambda_freeze_epochs} epochs."
+                )
+            if epo == lambda_freeze_epochs:
+                train_loss.lambda_halo_raw.requires_grad_(True)
+                train_loss.lambda_bloom_raw.requires_grad_(True)
+                with torch.no_grad():
+                    halo_now = train_loss.get_lambda_halo().detach().cpu().tolist()
+                    bloom_now = train_loss.get_lambda_bloom().detach().cpu().tolist()
+                logger.info(
+                    "Lambda learning is unfrozen at epoch %d. Current lambdas: halo=%s, bloom=%s",
+                    epo + 1, [round(v, 4) for v in halo_now], [round(v, 4) for v in bloom_now]
+                )
             current_lr = optimizer.param_groups[0]['lr']
             
             epoch_losses = []
@@ -185,7 +224,7 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
                 'loss_grad': [],
                 'loss_l1': [],
                 'loss_ssim': [],
-                'loss_halo': [],
+                'loss_reg': [],
             }
             
             for it, (image_ir, image_vis) in enumerate(trainloader):
@@ -225,7 +264,7 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
                 optimizer.zero_grad()
 
 
-                loss_total, loss_grad, loss_l1, loss_ssim, loss_halo = train_loss(
+                loss_total, loss_grad, loss_l1, loss_ssim, loss_reg = train_loss(
                     image_ir, image_vis_ycrcb[:, 0:1, :, :], logits
                 )
                 # loss_total_adv, loss_mse_adv, loss_ssim_adv = train_loss(logits_adv, image_gt_ycbcr)
@@ -243,7 +282,7 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
                 epoch_loss_dict['loss_grad'].append(float(loss_grad.detach().cpu()))
                 epoch_loss_dict['loss_l1'].append(float(loss_l1.detach().cpu()))
                 epoch_loss_dict['loss_ssim'].append(float(loss_ssim.detach().cpu()))
-                epoch_loss_dict['loss_halo'].append(float(loss_halo.detach().cpu()))
+                epoch_loss_dict['loss_reg'].append(float(loss_reg.detach().cpu()))
                 
                 loss.backward()
                 
@@ -273,16 +312,23 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
                         f"(l1: {avg_loss_dict['loss_l1']:.4f}, "
                         f"grad: {avg_loss_dict['loss_grad']:.4f}, "
                         f"ssim: {avg_loss_dict['loss_ssim']:.4f}, "
-                        f"halo: {avg_loss_dict['loss_halo']:.4f}, "
+                        f"reg(h+b): {avg_loss_dict['loss_reg']:.4f}, "
                         f"LR: {current_lr:.6f})")
 
             writer.add_scalar('train/loss', avg_epoch_loss, epo + 1)
             writer.add_scalar('train/loss_grad', avg_loss_dict['loss_grad'], epo + 1)
             writer.add_scalar('train/loss_l1', avg_loss_dict['loss_l1'], epo + 1)
             writer.add_scalar('train/loss_ssim', avg_loss_dict['loss_ssim'], epo + 1)
-            writer.add_scalar('train/loss_halo', avg_loss_dict['loss_halo'], epo + 1)
+            writer.add_scalar('train/loss_reg', avg_loss_dict['loss_reg'], epo + 1)
             writer.add_scalar('train/lr', current_lr, epo + 1)
             writer.add_scalar('train/grad_norm', float(grad_norm), epo + 1)
+            with torch.no_grad():
+                halo_l = train_loss.get_lambda_halo().detach().cpu().tolist()
+                bloom_l = train_loss.get_lambda_bloom().detach().cpu().tolist()
+            for i, v in enumerate(halo_l):
+                writer.add_scalar(f'train/lambda_halo_{i+1}', v, epo + 1)
+            for i, v in enumerate(bloom_l):
+                writer.add_scalar(f'train/lambda_bloom_{i+1}', v, epo + 1)
 
             # 验证阶段
             train_model.eval()
@@ -305,12 +351,12 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
 
                     if tb_image_every > 0 and (epo % tb_image_every == 0) and it < 3:
                         if PREVIEW_WITH_MASK:
-                            M = train_loss.get_M_mask(image_ir)
-                            M_light = train_loss.get_M_light_mask(image_ir, image_vis_y)
-                            Mhalo = train_loss.get_M_halo_mask(image_ir, image_vis_y)
+                            # Preview uses union masks to match "original large mask" intuition.
+                            Mbloom = train_loss.get_M_bloom_mask_union(image_ir)
+                            Mhalo = train_loss.get_M_halo_mask_union(image_vis_y)
                             preview = make_preview_tensor(
                                 image_vis, image_ir, fused_clamped, image_vis_ycrcb,
-                                M=M, M_light=M_light, Mhalo=Mhalo
+                                Mbloom=Mbloom, Mhalo=Mhalo
                             )
                         else:
                             preview = make_preview_tensor(
@@ -378,12 +424,11 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
                         fused = train_model(image_vis_y, image_ir).clamp(0, 1)
 
                         if PREVIEW_WITH_MASK:
-                            M = train_loss.get_M_mask(image_ir)
-                            M_light = train_loss.get_M_light_mask(image_ir, image_vis_y)
-                            Mhalo = train_loss.get_M_halo_mask(image_ir, image_vis_y)
+                            Mbloom = train_loss.get_M_bloom_mask_union(image_ir)
+                            Mhalo = train_loss.get_M_halo_mask_union(image_vis_y)
                             preview = make_preview_tensor(
                                 image_vis, image_ir, fused, image_vis_ycrcb,
-                                M=M, M_light=M_light, Mhalo=Mhalo
+                                Mbloom=Mbloom, Mhalo=Mhalo
                             )
                         else:
                             preview = make_preview_tensor(image_vis, image_ir, fused, image_vis_ycrcb)
@@ -395,7 +440,12 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1)
             if val_score > val_best_score:
                 old_score = val_best_score
                 val_best_score = val_score
-                torch.save(train_model.state_dict(), best_model_path)
+                best_model_name = f'{exp_id}-val{val_best_score:.6f}-best.pth'
+                new_best_model_path = os.path.join(model_path, best_model_name)
+                torch.save(train_model.state_dict(), new_best_model_path)
+                if best_model_path is not None and best_model_path != new_best_model_path and os.path.exists(best_model_path):
+                    os.remove(best_model_path)
+                best_model_path = new_best_model_path
                 logger.info("Best model updated: {} (score: {:.4f} -> {:.4f})".format(
                     best_model_name, old_score, val_best_score))
                 patience = 0
@@ -415,9 +465,10 @@ if __name__ == "__main__":
     seed_everything(2026)
 
     logpath = './logs'
+    run_id = time.strftime("%Y%m%d-%H%M%S")
     logger = logging.getLogger()
-    setup_logger(logpath)
-    train(logger, tb_root=os.path.join(logpath, 'tensorboard'), tb_image_every=1)
+    setup_logger(logpath, run_id=run_id)
+    train(logger, exp_name=run_id, tb_root=os.path.join(logpath, 'tensorboard'), tb_image_every=1)
     logger.info("Train finish!")
 
 

@@ -4,12 +4,14 @@ import logging
 import torch.distributed as dist
 
 
-def setup_logger(logpth):
+def setup_logger(logpth, run_id=None):
     
     # 确保日志目录存在
     os.makedirs(logpth, exist_ok=True)
     
-    logfile = 'A2RNet-{}.log'.format(time.strftime('%Y-%m-%d-%H-%M-%S'))
+    if run_id is None:
+        run_id = time.strftime('%Y%m%d-%H%M%S')
+    logfile = f'{run_id}.log'
     logfile = os.path.join(logpth, logfile)
         
     FORMAT = '%(levelname)s %(filename)s(%(lineno)d): %(message)s'

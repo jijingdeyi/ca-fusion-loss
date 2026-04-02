@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from loss_mef import fusion_loss_mef
+from loss_v3 import fusion_loss_mef
 from rgb2ycbcr import RGB2YCrCb
 
 
@@ -48,15 +48,13 @@ def _to_rgb_mask(mask_1chw: torch.Tensor) -> np.ndarray:
 def _save_compare(
     vis_rgb: np.ndarray,
     ir_1chw: torch.Tensor,
-    mlight_base_1chw: torch.Tensor,
-    mlight_post_1chw: torch.Tensor,
+    mlight_1chw: torch.Tensor,
     out_path: str,
 ) -> None:
     left = (vis_rgb * 255.0).astype(np.uint8)
     ir_rgb = (_to_rgb_mask(ir_1chw) * 255.0).astype(np.uint8)
-    mid = (_to_rgb_mask(mlight_base_1chw) * 255.0).astype(np.uint8)
-    right = (_to_rgb_mask(mlight_post_1chw) * 255.0).astype(np.uint8)
-    canvas = np.concatenate([left, ir_rgb, mid, right], axis=1)  # [H, 4W, 3]
+    mlight_rgb = (_to_rgb_mask(mlight_1chw) * 255.0).astype(np.uint8)
+    canvas = np.concatenate([left, ir_rgb, mlight_rgb], axis=1)  # [H, 3W, 3]
 
     Image.fromarray(canvas, mode="RGB").save(out_path)
 
@@ -77,11 +75,10 @@ def main() -> None:
         vis = _load_vis(vi_path)
         vis_y = _vis_np_to_vis_y_tensor(vis)
         with torch.no_grad():
-            m_light_base = loss_obj.get_M_light_base_mask(ir)
-            m_light_post = loss_obj.get_M_light_mask(ir, vis_y)
+            m_light = loss_obj.get_M_light_mask(ir, vis_y)
 
         out_path = os.path.join(OUT_DIR, f"{sample_id}_vis_vs_mlight.png")
-        _save_compare(vis, ir, m_light_base, m_light_post, out_path)
+        _save_compare(vis, ir, m_light, out_path)
         print(f"[ok] {sample_id}: {out_path}")
 
 
