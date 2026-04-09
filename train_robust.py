@@ -30,7 +30,7 @@ from PIL import Image
 
 warnings.filterwarnings('ignore')
 
-# 在 TensorBoard 预览中展示 Mbloom 与 Mhalo
+# 在 TensorBoard 预览中展示 Mbloom 与 Mhalo（仅当损失模块提供 mask 接口时生效）
 PREVIEW_WITH_MASK = True
 # 固定预览样本（来自 TRAIN_PATH，和 train/val 切分无关）
 PREVIEW_IMAGE_IDS = {"00917N", "01185N", "01154N", "00326D", "00328D"}
@@ -139,34 +139,22 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
     # init_weights(train_model)
     train_model.train()
 
-    train_loss = fusion_loss_mef(
-        w_l1=15.0,
-        w_grad=14.0,
-        w_ssim=20.0,
-        halo_bins=(0.90, 0.95, 0.98, 1.00),
-        bloom_bins=(0.90, 0.95, 0.98, 1.00),
-        lambda_halo_init=(0.35, 0.50, 0.70),
-        lambda_bloom_init=(0.35, 0.35, 0.35),
-        lambda_min=0.10,
-    )
-    train_loss.to(device)  
+    train_loss = fusion_loss_mef()
+    train_loss.to(device)
 
     optimizer = torch.optim.Adam(
-        itertools.chain(
-            train_model.parameters(),
-            [train_loss.lambda_halo_raw, train_loss.lambda_bloom_raw]
-        ),
-        lr=lr_start
+        itertools.chain(train_model.parameters(), train_loss.parameters()),
+        lr=lr_start,
     )
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='max', factor=0.75, patience=2, min_lr=1e-6
     )
-    epoch = 100
+    epoch = 200
 
     st = glob_st = time.time()
     val_best_score = 0.0
-    patience_max = 10
+    patience_max = 20
     patience = 0
     
     # 生成实验ID（用于统一日志、tensorboard 与模型命名）
@@ -183,14 +171,18 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
         halo_l = train_loss.get_lambda_halo().detach().cpu().tolist()
         bloom_l = train_loss.get_lambda_bloom().detach().cpu().tolist()
     logger.info(
-        "Loss config => w_l1=%.2f, w_grad=%.2f, w_ssim=%.2f, halo_bins=%s, bloom_bins=%s, "
+        "loss_v3 => w_l1=%.2f, w_grad=%.2f, w_ssim=%.2f, halo_bins=%s, bloom_bins=%s, "
         "lambda_halo_init=%s, lambda_bloom_init=%s, lambda_min=%.2f, lambda_freeze_epochs=%d",
-        train_loss.w_l1, train_loss.w_grad, train_loss.w_ssim,
-        train_loss.halo_bins, train_loss.bloom_bins,
-        [round(v, 4) for v in halo_l], [round(v, 4) for v in bloom_l], train_loss.lambda_min,
-        lambda_freeze_epochs
+        train_loss.w_l1,
+        train_loss.w_grad,
+        train_loss.w_ssim,
+        train_loss.halo_bins,
+        train_loss.bloom_bins,
+        [round(v, 4) for v in halo_l],
+        [round(v, 4) for v in bloom_l],
+        train_loss.lambda_min,
+        lambda_freeze_epochs,
     )
-    logger.info("Base loss weights are fixed constants: w_l1/w_grad/w_ssim are not learnable.")
 
     fixed_preview_samples = build_fixed_previews_from_train_path(TRAIN_PATH, PREVIEW_IMAGE_IDS)
     found_ids = {sid for sid, _, _ in fixed_preview_samples}
@@ -205,7 +197,8 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
                 train_loss.lambda_halo_raw.requires_grad_(False)
                 train_loss.lambda_bloom_raw.requires_grad_(False)
                 logger.info(
-                    f"Lambda learning is frozen for first {lambda_freeze_epochs} epochs."
+                    "Lambda learning frozen for the first %d epochs.",
+                    lambda_freeze_epochs,
                 )
             if epo == lambda_freeze_epochs:
                 train_loss.lambda_halo_raw.requires_grad_(True)
@@ -214,8 +207,10 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
                     halo_now = train_loss.get_lambda_halo().detach().cpu().tolist()
                     bloom_now = train_loss.get_lambda_bloom().detach().cpu().tolist()
                 logger.info(
-                    "Lambda learning is unfrozen at epoch %d. Current lambdas: halo=%s, bloom=%s",
-                    epo + 1, [round(v, 4) for v in halo_now], [round(v, 4) for v in bloom_now]
+                    "Lambda unfrozen at epoch %d. lambdas: halo=%s, bloom=%s",
+                    epo + 1,
+                    [round(v, 4) for v in halo_now],
+                    [round(v, 4) for v in bloom_now],
                 )
             current_lr = optimizer.param_groups[0]['lr']
             
@@ -287,7 +282,10 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
                 loss.backward()
                 
                 # 梯度裁剪，防止梯度爆炸
-                grad_norm = torch.nn.utils.clip_grad_norm_(train_model.parameters(), max_norm=1.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    itertools.chain(train_model.parameters(), train_loss.parameters()),
+                    max_norm=1.0,
+                )
                 
                 optimizer.step()
                 
@@ -322,13 +320,16 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
             writer.add_scalar('train/loss_reg', avg_loss_dict['loss_reg'], epo + 1)
             writer.add_scalar('train/lr', current_lr, epo + 1)
             writer.add_scalar('train/grad_norm', float(grad_norm), epo + 1)
-            with torch.no_grad():
-                halo_l = train_loss.get_lambda_halo().detach().cpu().tolist()
-                bloom_l = train_loss.get_lambda_bloom().detach().cpu().tolist()
-            for i, v in enumerate(halo_l):
-                writer.add_scalar(f'train/lambda_halo_{i+1}', v, epo + 1)
-            for i, v in enumerate(bloom_l):
-                writer.add_scalar(f'train/lambda_bloom_{i+1}', v, epo + 1)
+            if hasattr(train_loss, 'get_lambda_halo'):
+                with torch.no_grad():
+                    halo_l = train_loss.get_lambda_halo().detach().cpu().tolist()
+                for i, v in enumerate(halo_l):
+                    writer.add_scalar(f'train/lambda_halo_{i+1}', v, epo + 1)
+            if hasattr(train_loss, 'get_lambda_bloom'):
+                with torch.no_grad():
+                    bloom_l = train_loss.get_lambda_bloom().detach().cpu().tolist()
+                for i, v in enumerate(bloom_l):
+                    writer.add_scalar(f'train/lambda_bloom_{i+1}', v, epo + 1)
 
             # 验证阶段
             train_model.eval()
@@ -350,8 +351,13 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
                     fused_clamped = fused.clamp(0, 1)
 
                     if tb_image_every > 0 and (epo % tb_image_every == 0) and it < 3:
-                        if PREVIEW_WITH_MASK:
-                            # Preview uses union masks to match "original large mask" intuition.
+                        use_masks = (
+                            PREVIEW_WITH_MASK
+                            and hasattr(train_loss, 'get_M_bloom_mask_union')
+                            and hasattr(train_loss, 'get_M_halo_mask_union')
+                        )
+                        if use_masks:
+                            # Preview uses union masks when the loss module provides them.
                             Mbloom = train_loss.get_M_bloom_mask_union(image_ir)
                             Mhalo = train_loss.get_M_halo_mask_union(image_vis_y)
                             preview = make_preview_tensor(
@@ -423,7 +429,12 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
                         image_vis_y = image_vis_ycrcb[:, 0:1, :, :]
                         fused = train_model(image_vis_y, image_ir).clamp(0, 1)
 
-                        if PREVIEW_WITH_MASK:
+                        use_masks = (
+                            PREVIEW_WITH_MASK
+                            and hasattr(train_loss, 'get_M_bloom_mask_union')
+                            and hasattr(train_loss, 'get_M_halo_mask_union')
+                        )
+                        if use_masks:
                             Mbloom = train_loss.get_M_bloom_mask_union(image_ir)
                             Mhalo = train_loss.get_M_halo_mask_union(image_vis_y)
                             preview = make_preview_tensor(
@@ -440,7 +451,7 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
             if val_score > val_best_score:
                 old_score = val_best_score
                 val_best_score = val_score
-                best_model_name = f'{exp_id}-val{val_best_score:.6f}-best.pth'
+                best_model_name = f'{exp_id}-{val_best_score:.6f}-best.pth'
                 new_best_model_path = os.path.join(model_path, best_model_name)
                 torch.save(train_model.state_dict(), new_best_model_path)
                 if best_model_path is not None and best_model_path != new_best_model_path and os.path.exists(best_model_path):

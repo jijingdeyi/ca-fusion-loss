@@ -71,14 +71,14 @@ class fusion_loss_mef(nn.Module):
     """
 
     def __init__(self,
-                 w_l1=15.0,
-                 w_grad=14.0,
-                 w_ssim=20.0,
+                 w_l1=20,
+                 w_grad=20,
+                 w_ssim=10,
                  halo_bins=(0.90, 0.95, 0.98, 1.00),
                  bloom_bins=(0.90, 0.95, 0.98, 1.00),
-                 lambda_halo_init=(0.25, 0.45, 0.65),
-                 lambda_bloom_init=(0.45, 0.70, 0.95),
-                 lambda_min=0.10,
+                 lambda_halo_init=(0.46, 0.66, 0.92),
+                 lambda_bloom_init=(0.46, 0.46, 0.46),
+                 lambda_min=0.20,
                  eps_halo=0.00,
                  eps_bloom=0.00):
         super(fusion_loss_mef, self).__init__()
@@ -204,5 +204,4 @@ class fusion_loss_mef(nn.Module):
         weighted_bloom = sum(w * l for w, l in zip(lambda_bloom, loss_bloom_bins))
 
         fusion_loss = loss_l1 + loss_gradient + loss_SSIM + weighted_halo + weighted_bloom
-
         return fusion_loss, loss_gradient, loss_l1, loss_SSIM, (weighted_halo + weighted_bloom)
