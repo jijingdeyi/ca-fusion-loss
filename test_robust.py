@@ -7,8 +7,9 @@ import warnings
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
 
-from Ufuser import Ufuser
+from metafusion_net import FusionNet, _weights_init
 from dataset import testloader
 from rgb2ycbcr import RGB2YCrCb, YCrCb2RGB
 
@@ -18,11 +19,35 @@ warnings.filterwarnings('ignore')
 
 def load_model(checkpoint_path: str, device: torch.device) -> torch.nn.Module:
     """
-    加载与 train_robust.py 中一致的 Ufuser 模型。
+    加载与 train_robust.py 中一致的 MetaFusion 模型。
     """
-    model = Ufuser().to(device)
+    class MetaFusionInferModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fusion = FusionNet(block_num=3, feature_out=False)
+            self.fusion.apply(_weights_init)
+
+        def forward(self, ir: torch.Tensor, vi: torch.Tensor) -> torch.Tensor:
+            x = torch.cat([ir, vi, torch.abs(ir - vi), torch.max(ir, vi)], dim=1)
+            _, weights = self.fusion(x)  # [B,2,H,W]
+            weights = torch.softmax(weights, dim=1)
+            fused = weights[:, 0:1, :, :] * ir + weights[:, 1:2, :, :] * vi
+            return fused.clamp(0.0, 1.0)
+
+    model = MetaFusionInferModel().to(device)
     state = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(state)
+    # 兼容两种保存格式：{"fusion.xxx": ...} 或 {"xxx": ...}
+    try:
+        model.load_state_dict(state, strict=True)
+    except RuntimeError:
+        if isinstance(state, dict):
+            if any(k.startswith("fusion.") for k in state.keys()):
+                trimmed = {k[len("fusion."):]: v for k, v in state.items() if k.startswith("fusion.")}
+                model.fusion.load_state_dict(trimmed, strict=True)
+            else:
+                model.fusion.load_state_dict(state, strict=True)
+        else:
+            raise
     model.eval()
     return model
 
@@ -53,7 +78,7 @@ def _align_ir_vis_spatial(image_ir: torch.Tensor, image_vis: torch.Tensor) -> tu
 
 def _pad_hw_to_multiple(x: torch.Tensor, mult: int = 8) -> tuple[torch.Tensor, int, int]:
     """
-    Ufuser 三次 stride-2 + 反卷积上采样时，若 H/W 非 mult 的倍数，解码端与 skip 会差 1 像素。
+    为兼容不同网络结构，支持将 H/W pad 到 mult 的倍数并在输出端裁回。
     返回 (pad 后的张量, 原始 H, 原始 W)，用于输出裁回。
     """
     _, _, h, w = x.shape
@@ -87,7 +112,7 @@ def fuse_batch(model, image_ir, image_vis, device: torch.device):
     image_vis_ycrcb, _, _ = _pad_hw_to_multiple(image_vis_ycrcb, 8)
 
     with torch.no_grad():
-        fused_y = model(image_vis_y, image_ir)  # [B,1,H',W']
+        fused_y = model(image_ir, image_vis_y)
         fused_y = fused_y[:, :, :h0, :w0]
         fused_y_clamped = fused_y.clamp(0, 1)
 
@@ -155,14 +180,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--outdir",
-        default="./results/LLVIP/ours",
+        default="./results/MSRS/metafusion_retrain_with_ours/",
         type=str,
         nargs="?",
         help="dir to write fused results",
     )
     parser.add_argument(
         "--checkpoint",
-        default="model/20260403-151334-0.670514-best.pth",
+        default="model/20260421-103210-0.528084-best.pth",
         type=str,
         nargs="?",
         help="checkpoint path",

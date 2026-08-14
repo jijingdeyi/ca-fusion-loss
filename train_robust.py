@@ -1,4 +1,4 @@
-from Ufuser import Ufuser
+import torch.nn as nn
 
 from dataset import trainloader, valloader, TRAIN_PATH
 import datetime
@@ -23,6 +23,7 @@ from metric import (
     SSIM_function,
     composite_validation_score,
 )
+from metafusion_net import FusionNet, _weights_init
 
 
 import numpy as np
@@ -125,6 +126,32 @@ def build_fixed_previews_from_train_path(train_path, preview_ids):
     return samples
 
 
+def build_train_model():
+    """Build trainable MetaFusion model."""
+
+    class MetaFusionTrainModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fusion = FusionNet(block_num=3, feature_out=False)
+            self.fusion.apply(_weights_init)
+
+        def forward(self, ir: torch.Tensor, vi: torch.Tensor) -> torch.Tensor:
+            x = torch.cat([ir, vi, torch.abs(ir - vi), torch.max(ir, vi)], dim=1)
+            _, weights = self.fusion(x)  # [B,2,H,W], sigmoid output
+            weights = torch.softmax(weights, dim=1)
+            fused = weights[:, 0:1, :, :] * ir + weights[:, 1:2, :, :] * vi
+            return fused.clamp(0.0, 1.0)
+
+    return MetaFusionTrainModel()
+
+
+def forward_fused_y(model, image_ir, image_vis_y):
+    """
+    Run MetaFusion and keep output in [0, 1] for loss/metrics.
+    """
+    return model(image_ir, image_vis_y).clamp(0.0, 1.0)
+
+
 def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1, lambda_freeze_epochs=10):
 
     lr_start = 5e-4
@@ -134,16 +161,18 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    train_model = Ufuser()
+    train_model = build_train_model()
     train_model.to(device)
     # init_weights(train_model)
     train_model.train()
 
     train_loss = fusion_loss_mef()
     train_loss.to(device)
+    # MetaConv2d weights in metafusion are exposed via fusion.params(), not model.parameters().
+    meta_params = list(train_model.fusion.params())
 
     optimizer = torch.optim.Adam(
-        itertools.chain(train_model.parameters(), train_loss.parameters()),
+        itertools.chain(meta_params, train_loss.parameters()),
         lr=lr_start,
     )
 
@@ -172,7 +201,7 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
         bloom_l = train_loss.get_lambda_bloom().detach().cpu().tolist()
     logger.info(
         "loss_v3 => w_l1=%.2f, w_grad=%.2f, w_ssim=%.2f, halo_bins=%s, bloom_bins=%s, "
-        "lambda_halo_init=%s, lambda_bloom_init=%s, lambda_min=%.2f, lambda_freeze_epochs=%d",
+        "lambda_halo_current=%s, lambda_bloom_current=%s, lambda_min=%.2f, lambda_freeze_epochs=%d",
         train_loss.w_l1,
         train_loss.w_grad,
         train_loss.w_ssim,
@@ -230,7 +259,11 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
                 image_ir = image_ir.to(device)
                 image_vis_ycrcb = RGB2YCrCb(image_vis)
 
-                logits = train_model(image_vis_ycrcb[:, 0:1, :, :], image_ir)
+                logits = forward_fused_y(
+                    train_model,
+                    image_ir,
+                    image_vis_ycrcb[:, 0:1, :, :],
+                )
 
                 if it == 0:
                     with torch.no_grad():
@@ -283,7 +316,7 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
                 
                 # 梯度裁剪，防止梯度爆炸
                 grad_norm = torch.nn.utils.clip_grad_norm_(
-                    itertools.chain(train_model.parameters(), train_loss.parameters()),
+                    itertools.chain(meta_params, train_loss.parameters()),
                     max_norm=1.0,
                 )
                 
@@ -347,7 +380,11 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
                     image_vis_ycrcb = RGB2YCrCb(image_vis)
                     image_vis_y = image_vis_ycrcb[:, 0:1, :, :]
 
-                    fused = train_model(image_vis_y, image_ir)
+                    fused = forward_fused_y(
+                        train_model,
+                        image_ir,
+                        image_vis_y,
+                    )
                     fused_clamped = fused.clamp(0, 1)
 
                     if tb_image_every > 0 and (epo % tb_image_every == 0) and it < 3:
@@ -427,7 +464,11 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
                         image_vis = vis_cpu.unsqueeze(0).to(device) # [1,3,H,W]
                         image_vis_ycrcb = RGB2YCrCb(image_vis)
                         image_vis_y = image_vis_ycrcb[:, 0:1, :, :]
-                        fused = train_model(image_vis_y, image_ir).clamp(0, 1)
+                        fused = forward_fused_y(
+                            train_model,
+                            image_ir,
+                            image_vis_y,
+                        ).clamp(0, 1)
 
                         use_masks = (
                             PREVIEW_WITH_MASK

@@ -10,7 +10,7 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
 TRAIN_PATH = "/data/ykx/MSRS/train"
-TEST_PATH = "/data/ykx/llvip_test"
+TEST_PATH = "/data/ykx/MSRS/test"
 
 VAL_RATIO = 0.03  
 RANDOM_SEED = 42  
@@ -148,7 +148,7 @@ g.manual_seed(RANDOM_SEED)
 
 trainloader = DataLoader(
     train_dataset,
-    batch_size=4,
+    batch_size=2,
     shuffle=True,
     pin_memory=True,
     num_workers=NUM_WORKERS,
