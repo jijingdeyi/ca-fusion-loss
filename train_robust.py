@@ -1,3 +1,5 @@
+import argparse
+import json
 import torch.nn as nn
 
 from dataset import trainloader, valloader, TRAIN_PATH
@@ -24,6 +26,7 @@ from metric import (
     composite_validation_score,
 )
 from metafusion_net import FusionNet, _weights_init
+from Ufuser import Ufuser
 
 
 import numpy as np
@@ -126,8 +129,13 @@ def build_fixed_previews_from_train_path(train_path, preview_ids):
     return samples
 
 
-def build_train_model():
-    """Build trainable MetaFusion model."""
+def build_train_model(backbone="ufuser"):
+    """Build the fusion network. Paper main results use U-fuser (EMMA)."""
+    if backbone == "ufuser":
+        return Ufuser()
+
+    if backbone != "metafusion":
+        raise ValueError(f"Unknown backbone: {backbone}")
 
     class MetaFusionTrainModel(nn.Module):
         def __init__(self):
@@ -145,14 +153,37 @@ def build_train_model():
     return MetaFusionTrainModel()
 
 
-def forward_fused_y(model, image_ir, image_vis_y):
-    """
-    Run MetaFusion and keep output in [0, 1] for loss/metrics.
-    """
-    return model(image_ir, image_vis_y).clamp(0.0, 1.0)
+def net_trainable_params(train_model, backbone):
+    if backbone == "metafusion":
+        # MetaConv2d weights are exposed via fusion.params(), not model.parameters().
+        return list(train_model.fusion.params())
+    return list(train_model.parameters())
 
 
-def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1, lambda_freeze_epochs=10):
+def forward_fused_y(model, image_ir, image_vis_y, ufuser_call="named"):
+    """Fusion forward. ``named`` is (IR, VIS_Y); ``paper`` matches 151334: (VIS_Y, IR)."""
+    if ufuser_call == "paper":
+        out = model(image_vis_y, image_ir)
+    elif ufuser_call == "named":
+        out = model(image_ir, image_vis_y)
+    else:
+        raise ValueError(f"Unknown ufuser_call: {ufuser_call}")
+    return out.clamp(0.0, 1.0)
+
+
+def snapshot_bin_weights(train_loss):
+    """Effective bin weights after the lower-bound + softplus mapping."""
+    with torch.no_grad():
+        return {
+            "lambda_min": float(train_loss.lambda_min),
+            "lambda_halo": [round(v, 6) for v in train_loss.get_lambda_halo().detach().cpu().tolist()],
+            "lambda_bloom": [round(v, 6) for v in train_loss.get_lambda_bloom().detach().cpu().tolist()],
+        }
+
+
+def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
+          lambda_freeze_epochs=10, lambda_min=0.20, backbone="ufuser",
+          ufuser_call="named"):
 
     lr_start = 5e-4
     model_path = './model'
@@ -161,18 +192,21 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    train_model = build_train_model()
+    train_model = build_train_model(backbone)
     train_model.to(device)
     # init_weights(train_model)
     train_model.train()
 
-    train_loss = fusion_loss_mef()
+    if backbone != "ufuser" and ufuser_call == "paper":
+        logger.warning("ufuser_call=paper is ignored for backbone=%s", backbone)
+        ufuser_call = "named"
+
+    train_loss = fusion_loss_mef(lambda_min=lambda_min)
     train_loss.to(device)
-    # MetaConv2d weights in metafusion are exposed via fusion.params(), not model.parameters().
-    meta_params = list(train_model.fusion.params())
+    net_params = net_trainable_params(train_model, backbone)
 
     optimizer = torch.optim.Adam(
-        itertools.chain(meta_params, train_loss.parameters()),
+        itertools.chain(net_params, train_loss.parameters()),
         lr=lr_start,
     )
 
@@ -196,12 +230,19 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
     os.makedirs(tb_log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=tb_log_dir)
     logger.info(f'Train start! Experiment: {exp_id}')
+    logger.info("backbone=%s, train_batch=%s, ufuser_call=%s",
+                backbone, getattr(trainloader, "batch_size", None), ufuser_call)
+    if backbone == "ufuser" and ufuser_call == "paper":
+        logger.info("U-fuser call is (VIS_Y, IR), matching checkpoint 20260403-151334.")
+    elif backbone == "ufuser":
+        logger.info("U-fuser call is (IR, VIS_Y): I_en←IR, V_en←VIS.")
     with torch.no_grad():
         halo_l = train_loss.get_lambda_halo().detach().cpu().tolist()
         bloom_l = train_loss.get_lambda_bloom().detach().cpu().tolist()
     logger.info(
-        "loss_v3 => w_l1=%.2f, w_grad=%.2f, w_ssim=%.2f, halo_bins=%s, bloom_bins=%s, "
+        "loss_v3 => backbone=%s, w_l1=%.2f, w_grad=%.2f, w_ssim=%.2f, halo_bins=%s, bloom_bins=%s, "
         "lambda_halo_current=%s, lambda_bloom_current=%s, lambda_min=%.2f, lambda_freeze_epochs=%d",
+        backbone,
         train_loss.w_l1,
         train_loss.w_grad,
         train_loss.w_ssim,
@@ -263,6 +304,7 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
                     train_model,
                     image_ir,
                     image_vis_ycrcb[:, 0:1, :, :],
+                    ufuser_call=ufuser_call,
                 )
 
                 if it == 0:
@@ -316,7 +358,7 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
                 
                 # 梯度裁剪，防止梯度爆炸
                 grad_norm = torch.nn.utils.clip_grad_norm_(
-                    itertools.chain(meta_params, train_loss.parameters()),
+                    itertools.chain(net_params, train_loss.parameters()),
                     max_norm=1.0,
                 )
                 
@@ -339,12 +381,14 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
             avg_epoch_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else 0.0
             avg_loss_dict = {key: sum(vals) / len(vals) if vals else 0.0 
                             for key, vals in epoch_loss_dict.items()}
+            bin_w = snapshot_bin_weights(train_loss)
             logger.info(f"Epoch {epo+1}/{epoch} - Train Loss: {avg_epoch_loss:.4f} "
                         f"(l1: {avg_loss_dict['loss_l1']:.4f}, "
                         f"grad: {avg_loss_dict['loss_grad']:.4f}, "
                         f"ssim: {avg_loss_dict['loss_ssim']:.4f}, "
                         f"reg(h+b): {avg_loss_dict['loss_reg']:.4f}, "
-                        f"LR: {current_lr:.6f})")
+                        f"LR: {current_lr:.6f}, "
+                        f"halo={bin_w['lambda_halo']}, bloom={bin_w['lambda_bloom']})")
 
             writer.add_scalar('train/loss', avg_epoch_loss, epo + 1)
             writer.add_scalar('train/loss_grad', avg_loss_dict['loss_grad'], epo + 1)
@@ -384,6 +428,7 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
                         train_model,
                         image_ir,
                         image_vis_y,
+                        ufuser_call=ufuser_call,
                     )
                     fused_clamped = fused.clamp(0, 1)
 
@@ -468,6 +513,7 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
                             train_model,
                             image_ir,
                             image_vis_y,
+                            ufuser_call=ufuser_call,
                         ).clamp(0, 1)
 
                         use_masks = (
@@ -498,8 +544,22 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
                 if best_model_path is not None and best_model_path != new_best_model_path and os.path.exists(best_model_path):
                     os.remove(best_model_path)
                 best_model_path = new_best_model_path
+                bin_w = snapshot_bin_weights(train_loss)
+                bin_w.update({
+                    "epoch": epo + 1,
+                    "val_score": float(val_best_score),
+                    "model": best_model_name,
+                })
+                lambda_json_path = os.path.join(model_path, f"{exp_id}-best-lambdas.json")
+                with open(lambda_json_path, "w") as f:
+                    json.dump(bin_w, f, indent=2)
+                torch.save(train_loss.state_dict(), os.path.join(model_path, f"{exp_id}-loss-best.pth"))
                 logger.info("Best model updated: {} (score: {:.4f} -> {:.4f})".format(
                     best_model_name, old_score, val_best_score))
+                logger.info(
+                    "Best-ckpt bin weights: halo=%s, bloom=%s, lambda_min=%.2f",
+                    bin_w["lambda_halo"], bin_w["lambda_bloom"], bin_w["lambda_min"],
+                )
                 patience = 0
             else:
                 patience += 1
@@ -509,18 +569,68 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
                     break
     finally:
         writer.close()
+        bin_w = snapshot_bin_weights(train_loss)
+        last_model_path = os.path.join(model_path, f"{exp_id}-last.pth")
+        torch.save(train_model.state_dict(), last_model_path)
+        torch.save(train_loss.state_dict(), os.path.join(model_path, f"{exp_id}-loss-last.pth"))
+        with open(os.path.join(model_path, f"{exp_id}-last-lambdas.json"), "w") as f:
+            json.dump(bin_w, f, indent=2)
+        logger.info(
+            "Train end bin weights: halo=%s, bloom=%s, lambda_min=%.2f",
+            bin_w["lambda_halo"], bin_w["lambda_bloom"], bin_w["lambda_min"],
+        )
+        logger.info("Saved last-epoch model: %s", last_model_path)
 
 
 if __name__ == "__main__":
 
-    os.environ['CUDA_VISIBLE_DEVICES'] = '3'
+    parser = argparse.ArgumentParser(description="Train fusion model. Defaults match the paper U-fuser run.")
+    parser.add_argument("--lambda_min", type=float, default=0.20,
+                        help="Lower bound for halo/washout bin weights. Paper default is 0.20.")
+    parser.add_argument("--backbone", type=str, default="ufuser", choices=["ufuser", "metafusion"],
+                        help="Paper main results use ufuser.")
+    parser.add_argument("--gpu", type=str, default="3")
+    parser.add_argument("--tag", type=str, default="",
+                        help="Optional run-name suffix. Auto-set when lambda_min != 0.20.")
+    parser.add_argument(
+        "--ufuser-call",
+        dest="ufuser_call",
+        type=str,
+        default="named",
+        choices=["named", "paper"],
+        help="named: model(IR, VIS_Y). paper: model(VIS_Y, IR), required to match 151334.",
+    )
+    args = parser.parse_args()
+
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
     seed_everything(2026)
 
     logpath = './logs'
-    run_id = time.strftime("%Y%m%d-%H%M%S")
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    auto_tag = []
+    if args.backbone != "ufuser":
+        auto_tag.append(args.backbone)
+    if abs(args.lambda_min - 0.20) > 1e-8:
+        auto_tag.append(f"lmin{str(args.lambda_min).replace('.', 'p')}")
+    if args.backbone == "ufuser" and args.ufuser_call == "paper":
+        auto_tag.append("paper-call")
+    if args.tag:
+        run_id = f"{stamp}-{args.tag}"
+    elif auto_tag:
+        run_id = f"{stamp}-{'-'.join(auto_tag)}"
+    else:
+        run_id = stamp
     logger = logging.getLogger()
     setup_logger(logpath, run_id=run_id)
-    train(logger, exp_name=run_id, tb_root=os.path.join(logpath, 'tensorboard'), tb_image_every=1)
+    train(
+        logger,
+        exp_name=run_id,
+        tb_root=os.path.join(logpath, 'tensorboard'),
+        tb_image_every=1,
+        lambda_min=args.lambda_min,
+        backbone=args.backbone,
+        ufuser_call=args.ufuser_call,
+    )
     logger.info("Train finish!")
 
 

@@ -244,11 +244,11 @@ class LayerNorm(nn.Module):
 
 
 class Ufuser(nn.Module):
-    """Fusion module from EMMA, Equivariant Multi-Modality imAge fusion
+    """Fusion module from EMMA.
 
     Args:
-        i: infrared image tensor, [B, 1, H, W]
-        v: visible image tensor, [B, 1, H, W]
+        ir: infrared image tensor, [B, 1, H, W]
+        vis_y: visible Y-channel tensor, [B, 1, H, W]
 
     Returns:
         fused image tensor, [B, 1, H, W]
@@ -352,13 +352,13 @@ class Ufuser(nn.Module):
             padding_mode="reflect",
         )
 
-    def forward(self, i, v):
-        i_1 = self.I_en_1(i)
+    def forward(self, ir, vis_y):
+        i_1 = self.I_en_1(ir)
         i_2 = self.I_en_2(self.I_down1(i_1))
         i_3 = self.I_en_3(self.I_down2(i_2))
         i_4 = self.I_en_4(self.I_down3(i_3))
 
-        v_1 = self.V_en_1(v)
+        v_1 = self.V_en_1(vis_y)
         v_2 = self.V_en_2(self.V_down1(v_1))
         v_3 = self.V_en_3(self.V_down2(v_2))
         v_4 = self.V_en_4(self.V_down3(v_3))

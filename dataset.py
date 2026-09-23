@@ -12,9 +12,13 @@ from albumentations.pytorch import ToTensorV2
 TRAIN_PATH = "/data/ykx/MSRS/train"
 TEST_PATH = "/data/ykx/MSRS/test"
 
-VAL_RATIO = 0.03  
-RANDOM_SEED = 42  
+VAL_RATIO = 0.03
+RANDOM_SEED = 42
 NUM_WORKERS = 4
+# Paper U-fuser run: batch_size=4 → 262 iterations / epoch.
+TRAIN_BATCH_SIZE = 4
+
+
 def seed_worker(worker_id):
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
@@ -148,7 +152,7 @@ g.manual_seed(RANDOM_SEED)
 
 trainloader = DataLoader(
     train_dataset,
-    batch_size=2,
+    batch_size=TRAIN_BATCH_SIZE,
     shuffle=True,
     pin_memory=True,
     num_workers=NUM_WORKERS,

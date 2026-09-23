@@ -10,6 +10,7 @@ import torch.nn.functional as F
 import torch.nn as nn
 
 from metafusion_net import FusionNet, _weights_init
+from Ufuser import Ufuser
 from dataset import testloader
 from rgb2ycbcr import RGB2YCrCb, YCrCb2RGB
 
@@ -17,10 +18,14 @@ from rgb2ycbcr import RGB2YCrCb, YCrCb2RGB
 warnings.filterwarnings('ignore')
 
 
-def load_model(checkpoint_path: str, device: torch.device) -> torch.nn.Module:
-    """
-    加载与 train_robust.py 中一致的 MetaFusion 模型。
-    """
+def infer_backbone(state: dict) -> str:
+    keys = list(state.keys())
+    if any(k.startswith("V_en_") or k.startswith("I_en_") for k in keys):
+        return "ufuser"
+    return "metafusion"
+
+
+def load_metafusion(state: dict, device: torch.device) -> torch.nn.Module:
     class MetaFusionInferModel(nn.Module):
         def __init__(self):
             super().__init__()
@@ -35,19 +40,33 @@ def load_model(checkpoint_path: str, device: torch.device) -> torch.nn.Module:
             return fused.clamp(0.0, 1.0)
 
     model = MetaFusionInferModel().to(device)
-    state = torch.load(checkpoint_path, map_location=device)
-    # 兼容两种保存格式：{"fusion.xxx": ...} 或 {"xxx": ...}
     try:
         model.load_state_dict(state, strict=True)
     except RuntimeError:
-        if isinstance(state, dict):
-            if any(k.startswith("fusion.") for k in state.keys()):
-                trimmed = {k[len("fusion."):]: v for k, v in state.items() if k.startswith("fusion.")}
-                model.fusion.load_state_dict(trimmed, strict=True)
-            else:
-                model.fusion.load_state_dict(state, strict=True)
+        if any(k.startswith("fusion.") for k in state.keys()):
+            trimmed = {k[len("fusion."):]: v for k, v in state.items() if k.startswith("fusion.")}
+            model.fusion.load_state_dict(trimmed, strict=True)
         else:
-            raise
+            model.fusion.load_state_dict(state, strict=True)
+    return model
+
+
+def load_model(checkpoint_path: str, device: torch.device, backbone: str = "auto") -> torch.nn.Module:
+    state = torch.load(checkpoint_path, map_location=device)
+    if not isinstance(state, dict):
+        raise TypeError(f"Unexpected checkpoint type: {type(state)}")
+    if backbone == "auto":
+        backbone = infer_backbone(state)
+    print(f"Using backbone: {backbone}")
+
+    if backbone == "ufuser":
+        model = Ufuser().to(device)
+        model.load_state_dict(state, strict=True)
+    elif backbone == "metafusion":
+        model = load_metafusion(state, device)
+    else:
+        raise ValueError(f"Unknown backbone: {backbone}")
+
     model.eval()
     return model
 
@@ -91,11 +110,12 @@ def _pad_hw_to_multiple(x: torch.Tensor, mult: int = 8) -> tuple[torch.Tensor, i
     return x, h, w
 
 
-def fuse_batch(model, image_ir, image_vis, device: torch.device):
+def fuse_batch(model, image_ir, image_vis, device: torch.device, ufuser_call="named"):
     """
     参考 train_robust.py：使用 VIS 的 Y 通道 + IR 作为输入，输出融合后的 RGB 图像。
 
     兼容：可见光为灰度（1 通道）；IR/VI 分辨率略有差异；任意 H/W 通过 pad 到 8 的倍数避免解码与 skip 尺寸不一致。
+    ufuser_call=paper 时按 151334 的 (VIS_Y, IR) 调用，否则 (IR, VIS_Y)。
     """
     image_vis = image_vis.to(device)
     image_ir = image_ir.to(device)
@@ -112,7 +132,11 @@ def fuse_batch(model, image_ir, image_vis, device: torch.device):
     image_vis_ycrcb, _, _ = _pad_hw_to_multiple(image_vis_ycrcb, 8)
 
     with torch.no_grad():
-        fused_y = model(image_ir, image_vis_y)
+        use_paper = ufuser_call == "paper" and isinstance(model, Ufuser)
+        if use_paper:
+            fused_y = model(image_vis_y, image_ir)
+        else:
+            fused_y = model(image_ir, image_vis_y)
         fused_y = fused_y[:, :, :h0, :w0]
         fused_y_clamped = fused_y.clamp(0, 1)
 
@@ -142,7 +166,8 @@ def main(args):
     checkpoint_path = args.checkpoint
 
     print(f'Loading model from: {checkpoint_path}')
-    model = load_model(checkpoint_path, device)
+    print(f'ufuser_call={args.ufuser_call}')
+    model = load_model(checkpoint_path, device, backbone=args.backbone)
 
     os.makedirs(args.outdir, mode=0o777, exist_ok=True)
 
@@ -154,7 +179,9 @@ def main(args):
     ir_files = getattr(testloader.dataset, "files1", None)
 
     for idx, (image_ir, image_vis) in enumerate(testloader):
-        fused_rgb = fuse_batch(model, image_ir, image_vis, device)  # [1,3,H,W]
+        fused_rgb = fuse_batch(
+            model, image_ir, image_vis, device, ufuser_call=args.ufuser_call
+        )  # [1,3,H,W]
         fused_img = fused_rgb[0]  # [3,H,W]
 
         # 使用 IR 路径的文件名保存（若可用），否则用索引命名
@@ -176,24 +203,39 @@ def main(args):
 
 if __name__ == "__main__":
 
-    os.environ['CUDA_VISIBLE_DEVICES'] = '3'
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--outdir",
-        default="./results/MSRS/metafusion_retrain_with_ours/",
+        default="./results/MSRS/ufuser/",
         type=str,
         nargs="?",
-        help="dir to write fused results",
+        help="dir to write fused results; use a new folder per run",
     )
     parser.add_argument(
         "--checkpoint",
-        default="model/20260421-103210-0.528084-best.pth",
+        default="model/20260403-151334-0.670514-best-paper.pth",
         type=str,
         nargs="?",
         help="checkpoint path",
     )
+    parser.add_argument(
+        "--backbone",
+        default="auto",
+        choices=["auto", "ufuser", "metafusion"],
+        help="auto: infer from checkpoint keys",
+    )
+    parser.add_argument("--gpu", type=str, default="3")
+    parser.add_argument(
+        "--ufuser-call",
+        dest="ufuser_call",
+        type=str,
+        default="named",
+        choices=["named", "paper"],
+        help="named: model(IR, VIS_Y). paper: model(VIS_Y, IR), required for 151334.",
+    )
 
     args = parser.parse_args()
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
     main(args)
 
 
