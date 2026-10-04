@@ -1,0 +1,11 @@
+torch>=1.13
+torchvision
+numpy
+pillow
+opencv-python
+albumentations
+natsort
+einops
+scipy
+pytorch-msssim
+tensorboard

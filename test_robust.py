@@ -174,11 +174,26 @@ def main(args):
     print('Start fusion on test set...')
     start_time = time.time()
 
-    # 这里复用 dataset.testloader（MSRS 测试集），与 train_robust.py 保持一致
-    total = len(testloader)
-    ir_files = getattr(testloader.dataset, "files1", None)
+    if args.data_path:
+        from torch.utils.data import DataLoader
+        from dataset import Hinet_Dataset, val_transform
 
-    for idx, (image_ir, image_vis) in enumerate(testloader):
+        loader = DataLoader(
+            Hinet_Dataset(transforms_=val_transform, data_path=args.data_path),
+            batch_size=1,
+            shuffle=False,
+            num_workers=4,
+            drop_last=False,
+        )
+        print(f'Using data-path: {args.data_path}  n={len(loader.dataset)}')
+    else:
+        loader = testloader
+        print('Using default MSRS test set')
+
+    total = len(loader)
+    ir_files = getattr(loader.dataset, "files1", None)
+
+    for idx, (image_ir, image_vis) in enumerate(loader):
         fused_rgb = fuse_batch(
             model, image_ir, image_vis, device, ufuser_call=args.ufuser_call
         )  # [1,3,H,W]
@@ -206,14 +221,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--outdir",
-        default="./results/MSRS/ufuser/",
+        default="./results/MSRS/ours",
         type=str,
         nargs="?",
         help="dir to write fused results; use a new folder per run",
     )
     parser.add_argument(
         "--checkpoint",
-        default="model/20260403-151334-0.670514-best-paper.pth",
+        default="model/ours-best.pth",
         type=str,
         nargs="?",
         help="checkpoint path",
@@ -224,14 +239,20 @@ if __name__ == "__main__":
         choices=["auto", "ufuser", "metafusion"],
         help="auto: infer from checkpoint keys",
     )
-    parser.add_argument("--gpu", type=str, default="3")
+    parser.add_argument(
+        "--data-path",
+        default=None,
+        type=str,
+        help="Folder with ir/ and vi/. Default: MSRS test set from dataset.py",
+    )
+    parser.add_argument("--gpu", type=str, default="0")
     parser.add_argument(
         "--ufuser-call",
         dest="ufuser_call",
         type=str,
         default="named",
         choices=["named", "paper"],
-        help="named: model(IR, VIS_Y). paper: model(VIS_Y, IR), required for 151334.",
+        help="named: model(IR, VIS_Y). paper: model(VIS_Y, IR).",
     )
 
     args = parser.parse_args()

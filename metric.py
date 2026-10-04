@@ -6,25 +6,21 @@ import math
 import torch
 from pytorch_msssim import ssim, ms_ssim
 
-# 验证综合分数：各指标原始值的经验范围（用于线性归一化到 [0,1] 后取平均）
+# 验证综合分数：仅 MI / Qabf / VIF。SCD 与 SSIM 仍可记录，但不参与选模。
 
 VAL_METRIC_RANGES = {
     'mi':   (1.5, 6.5),
-    'scd':  (1.0, 1.9),
     'vif':  (0.4, 1.2),
-    'ssim': (0.5, 0.85),
     'qabf': (0.1, 0.8),
 }
 
 
-def composite_validation_score(
-    mi: float, qabf: float, scd: float, vif: float, ssim_score: float
-) -> float:
+def composite_validation_score(mi: float, qabf: float, vif: float) -> float:
     """
-    对五个原始指标做线性归一化并 clip 到 [0,1]，再取算术平均作为验证 Score。
+    对 MI、Qabf、VIF 做线性归一化并 clip 到 [0,1]，再取算术平均作为验证 Score。
     """
-    keys = ("mi", "qabf", "scd", "vif", "ssim")
-    raw = (mi, qabf, scd, vif, ssim_score)
+    keys = ("mi", "qabf", "vif")
+    raw = (mi, qabf, vif)
     normed = []
     for key, m in zip(keys, raw):
         lo, hi = VAL_METRIC_RANGES[key]
@@ -187,12 +183,9 @@ def Hab(im1, im2, gray_level, use_nats=True):
     im1 = np.clip(np.asarray(im1, dtype=np.int32), 0, gray_level - 1)
     im2 = np.clip(np.asarray(im2, dtype=np.int32), 0, gray_level - 1)
     log_fn = np.log if use_nats else lambda p: math.log2(p)
-    hang, lie = im1.shape
     N = gray_level
-    h = np.zeros((N, N))
-    for i in range(hang):
-        for j in range(lie):
-            h[im1[i, j], im2[i, j]] = h[im1[i, j], im2[i, j]] + 1
+    idx = im1.ravel() * N + im2.ravel()
+    h = np.bincount(idx, minlength=N * N).reshape(N, N).astype(np.float64)
     h = h / np.sum(h)
     im1_marg = np.sum(h, axis=0)
     im2_marg = np.sum(h, axis=1)

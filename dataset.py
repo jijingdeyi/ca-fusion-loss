@@ -9,8 +9,7 @@ import random
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
-TRAIN_PATH = "/data/ykx/MSRS/train"
-TEST_PATH = "/data/ykx/MSRS/test"
+from config import TEST_PATH, TRAIN_PATH
 
 VAL_RATIO = 0.03
 RANDOM_SEED = 42

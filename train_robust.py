@@ -15,7 +15,6 @@ from torch.utils.tensorboard import SummaryWriter
 import warnings
 from rgb2ycbcr import RGB2YCrCb, YCrCb2RGB
 import random
-import itertools
 
 from metric import (
     VIF_function,
@@ -23,7 +22,6 @@ from metric import (
     MI_function,
     SCD_function,
     SSIM_function,
-    composite_validation_score,
 )
 from metafusion_net import FusionNet, _weights_init
 from Ufuser import Ufuser
@@ -171,19 +169,20 @@ def forward_fused_y(model, image_ir, image_vis_y, ufuser_call="named"):
     return out.clamp(0.0, 1.0)
 
 
-def snapshot_bin_weights(train_loss):
-    """Effective bin weights after the lower-bound + softplus mapping."""
-    with torch.no_grad():
-        return {
-            "lambda_min": float(train_loss.lambda_min),
-            "lambda_halo": [round(v, 6) for v in train_loss.get_lambda_halo().detach().cpu().tolist()],
-            "lambda_bloom": [round(v, 6) for v in train_loss.get_lambda_bloom().detach().cpu().tolist()],
-        }
+def snapshot_loss_hparams(train_loss):
+    return {
+        "q_bright": float(train_loss.q_bright),
+        "delta": float(train_loss.delta),
+        "w_l1": float(train_loss.w_l1),
+        "w_grad": float(train_loss.w_grad),
+        "lambda_halo": float(train_loss.lambda_halo),
+        "lambda_bloom": float(train_loss.lambda_bloom),
+    }
 
 
 def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
-          lambda_freeze_epochs=10, lambda_min=0.20, backbone="ufuser",
-          ufuser_call="named"):
+          backbone="ufuser", ufuser_call="named", lambda_halo=1.0, lambda_bloom=0.5,
+          q_bright=0.90):
 
     lr_start = 5e-4
     model_path = './model'
@@ -201,14 +200,13 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
         logger.warning("ufuser_call=paper is ignored for backbone=%s", backbone)
         ufuser_call = "named"
 
-    train_loss = fusion_loss_mef(lambda_min=lambda_min)
+    train_loss = fusion_loss_mef(
+        lambda_halo=lambda_halo, lambda_bloom=lambda_bloom, q_bright=q_bright
+    )
     train_loss.to(device)
     net_params = net_trainable_params(train_model, backbone)
 
-    optimizer = torch.optim.Adam(
-        itertools.chain(net_params, train_loss.parameters()),
-        lr=lr_start,
-    )
+    optimizer = torch.optim.Adam(net_params, lr=lr_start)
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='max', factor=0.75, patience=2, min_lr=1e-6
@@ -236,22 +234,26 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
         logger.info("U-fuser call is (VIS_Y, IR), matching checkpoint 20260403-151334.")
     elif backbone == "ufuser":
         logger.info("U-fuser call is (IR, VIS_Y): I_en←IR, V_en←VIS.")
-    with torch.no_grad():
-        halo_l = train_loss.get_lambda_halo().detach().cpu().tolist()
-        bloom_l = train_loss.get_lambda_bloom().detach().cpu().tolist()
     logger.info(
-        "loss_v3 => backbone=%s, w_l1=%.2f, w_grad=%.2f, w_ssim=%.2f, halo_bins=%s, bloom_bins=%s, "
-        "lambda_halo_current=%s, lambda_bloom_current=%s, lambda_min=%.2f, lambda_freeze_epochs=%d",
-        backbone,
+        "loss_v3 => additive max-int/max-grad, no SSIM, fixed lambdas. "
+        "w_l1=%.2f, w_grad=%.2f, lambda_halo=%.3f, lambda_bloom=%.3f, "
+        "q_bright=%.2f, delta=%.3f. "
+        "Halo mask: VIS>=q AND VIS>IR. Washout mask: IR>=q AND IR>VIS. "
+        "Val selection: Qabf only.",
         train_loss.w_l1,
         train_loss.w_grad,
-        train_loss.w_ssim,
-        train_loss.halo_bins,
-        train_loss.bloom_bins,
-        [round(v, 4) for v in halo_l],
-        [round(v, 4) for v in bloom_l],
-        train_loss.lambda_min,
-        lambda_freeze_epochs,
+        train_loss.lambda_halo,
+        train_loss.lambda_bloom,
+        train_loss.q_bright,
+        train_loss.delta,
+    )
+    cov = max(1.0 - train_loss.q_bright, 1e-6)
+    logger.info(
+        "Per-pixel pull vs intensity on candidate pixels is about "
+        "halo=%.2fx, washout=%.2fx  (lambda / (w_l1 * (1-q)), q=%.2f).",
+        train_loss.lambda_halo / (train_loss.w_l1 * cov),
+        train_loss.lambda_bloom / (train_loss.w_l1 * cov),
+        train_loss.q_bright,
     )
 
     fixed_preview_samples = build_fixed_previews_from_train_path(TRAIN_PATH, PREVIEW_IMAGE_IDS)
@@ -263,33 +265,14 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
 
     try:
         for epo in range(epoch):
-            if epo == 0:
-                train_loss.lambda_halo_raw.requires_grad_(False)
-                train_loss.lambda_bloom_raw.requires_grad_(False)
-                logger.info(
-                    "Lambda learning frozen for the first %d epochs.",
-                    lambda_freeze_epochs,
-                )
-            if epo == lambda_freeze_epochs:
-                train_loss.lambda_halo_raw.requires_grad_(True)
-                train_loss.lambda_bloom_raw.requires_grad_(True)
-                with torch.no_grad():
-                    halo_now = train_loss.get_lambda_halo().detach().cpu().tolist()
-                    bloom_now = train_loss.get_lambda_bloom().detach().cpu().tolist()
-                logger.info(
-                    "Lambda unfrozen at epoch %d. lambdas: halo=%s, bloom=%s",
-                    epo + 1,
-                    [round(v, 4) for v in halo_now],
-                    [round(v, 4) for v in bloom_now],
-                )
             current_lr = optimizer.param_groups[0]['lr']
             
             epoch_losses = []
             epoch_loss_dict = {
                 'loss_grad': [],
                 'loss_l1': [],
-                'loss_ssim': [],
                 'loss_reg': [],
+                'mask_cov': [],
             }
             
             for it, (image_ir, image_vis) in enumerate(trainloader):
@@ -334,7 +317,7 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
                 optimizer.zero_grad()
 
 
-                loss_total, loss_grad, loss_l1, loss_ssim, loss_reg = train_loss(
+                loss_total, loss_grad, loss_l1, loss_reg, mask_cov = train_loss(
                     image_ir, image_vis_ycrcb[:, 0:1, :, :], logits
                 )
                 # loss_total_adv, loss_mse_adv, loss_ssim_adv = train_loss(logits_adv, image_gt_ycbcr)
@@ -351,14 +334,14 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
                 epoch_losses.append(loss.item())
                 epoch_loss_dict['loss_grad'].append(float(loss_grad.detach().cpu()))
                 epoch_loss_dict['loss_l1'].append(float(loss_l1.detach().cpu()))
-                epoch_loss_dict['loss_ssim'].append(float(loss_ssim.detach().cpu()))
                 epoch_loss_dict['loss_reg'].append(float(loss_reg.detach().cpu()))
+                epoch_loss_dict['mask_cov'].append(float(mask_cov.detach().cpu()))
                 
                 loss.backward()
                 
                 # 梯度裁剪，防止梯度爆炸
                 grad_norm = torch.nn.utils.clip_grad_norm_(
-                    itertools.chain(net_params, train_loss.parameters()),
+                    net_params,
                     max_norm=1.0,
                 )
                 
@@ -381,32 +364,20 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
             avg_epoch_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else 0.0
             avg_loss_dict = {key: sum(vals) / len(vals) if vals else 0.0 
                             for key, vals in epoch_loss_dict.items()}
-            bin_w = snapshot_bin_weights(train_loss)
             logger.info(f"Epoch {epo+1}/{epoch} - Train Loss: {avg_epoch_loss:.4f} "
                         f"(l1: {avg_loss_dict['loss_l1']:.4f}, "
                         f"grad: {avg_loss_dict['loss_grad']:.4f}, "
-                        f"ssim: {avg_loss_dict['loss_ssim']:.4f}, "
-                        f"reg(h+b): {avg_loss_dict['loss_reg']:.4f}, "
-                        f"LR: {current_lr:.6f}, "
-                        f"halo={bin_w['lambda_halo']}, bloom={bin_w['lambda_bloom']})")
+                        f"reg: {avg_loss_dict['loss_reg']:.4f}, "
+                        f"mask_cov: {avg_loss_dict['mask_cov']:.4f}, "
+                        f"LR: {current_lr:.6f})")
 
             writer.add_scalar('train/loss', avg_epoch_loss, epo + 1)
             writer.add_scalar('train/loss_grad', avg_loss_dict['loss_grad'], epo + 1)
             writer.add_scalar('train/loss_l1', avg_loss_dict['loss_l1'], epo + 1)
-            writer.add_scalar('train/loss_ssim', avg_loss_dict['loss_ssim'], epo + 1)
             writer.add_scalar('train/loss_reg', avg_loss_dict['loss_reg'], epo + 1)
+            writer.add_scalar('train/mask_cov', avg_loss_dict['mask_cov'], epo + 1)
             writer.add_scalar('train/lr', current_lr, epo + 1)
             writer.add_scalar('train/grad_norm', float(grad_norm), epo + 1)
-            if hasattr(train_loss, 'get_lambda_halo'):
-                with torch.no_grad():
-                    halo_l = train_loss.get_lambda_halo().detach().cpu().tolist()
-                for i, v in enumerate(halo_l):
-                    writer.add_scalar(f'train/lambda_halo_{i+1}', v, epo + 1)
-            if hasattr(train_loss, 'get_lambda_bloom'):
-                with torch.no_grad():
-                    bloom_l = train_loss.get_lambda_bloom().detach().cpu().tolist()
-                for i, v in enumerate(bloom_l):
-                    writer.add_scalar(f'train/lambda_bloom_{i+1}', v, epo + 1)
 
             # 验证阶段
             train_model.eval()
@@ -439,9 +410,8 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
                             and hasattr(train_loss, 'get_M_halo_mask_union')
                         )
                         if use_masks:
-                            # Preview uses union masks when the loss module provides them.
-                            Mbloom = train_loss.get_M_bloom_mask_union(image_ir)
-                            Mhalo = train_loss.get_M_halo_mask_union(image_vis_y)
+                            Mbloom = train_loss.get_M_bloom_mask_union(image_ir, image_vis_y)
+                            Mhalo = train_loss.get_M_halo_mask_union(image_ir, image_vis_y)
                             preview = make_preview_tensor(
                                 image_vis, image_ir, fused_clamped, image_vis_ycrcb,
                                 Mbloom=Mbloom, Mhalo=Mhalo
@@ -474,15 +444,13 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
                     total_ssim += ssim_val
                     val_count += 1
 
-            # 验证集上五项指标的原始均值，再按经验范围归一化后平均得到 val_score
+            # 验证集上记录五项；选模和学习率只看 Qabf
             avg_mi = total_mi / val_count
             avg_qabf = total_qabf / val_count
             avg_scd = total_scd / val_count
             avg_vif = total_vif / val_count
             avg_ssim = total_ssim / val_count
-            val_score = composite_validation_score(
-                avg_mi, avg_qabf, avg_scd, avg_vif, avg_ssim
-            )
+            val_score = float(avg_qabf)
 
             logger.info(
                 f"Epoch {epo + 1} val raw metrics — "
@@ -490,7 +458,7 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
                 f"vif={avg_vif:.6f}, ssim={avg_ssim:.6f}"
             )
             logger.info(
-                f"Epoch {epo + 1} val_score (normalized mean of five)={val_score:.6f}"
+                f"Epoch {epo + 1} val_score (Qabf)={val_score:.6f}"
             )
 
             writer.add_scalar('val/mi', avg_mi, epo + 1)
@@ -522,8 +490,8 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
                             and hasattr(train_loss, 'get_M_halo_mask_union')
                         )
                         if use_masks:
-                            Mbloom = train_loss.get_M_bloom_mask_union(image_ir)
-                            Mhalo = train_loss.get_M_halo_mask_union(image_vis_y)
+                            Mbloom = train_loss.get_M_bloom_mask_union(image_ir, image_vis_y)
+                            Mhalo = train_loss.get_M_halo_mask_union(image_ir, image_vis_y)
                             preview = make_preview_tensor(
                                 image_vis, image_ir, fused, image_vis_ycrcb,
                                 Mbloom=Mbloom, Mhalo=Mhalo
@@ -544,22 +512,20 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
                 if best_model_path is not None and best_model_path != new_best_model_path and os.path.exists(best_model_path):
                     os.remove(best_model_path)
                 best_model_path = new_best_model_path
-                bin_w = snapshot_bin_weights(train_loss)
-                bin_w.update({
+                hparams = snapshot_loss_hparams(train_loss)
+                hparams.update({
                     "epoch": epo + 1,
                     "val_score": float(val_best_score),
+                    "val_mi": float(avg_mi),
+                    "val_qabf": float(avg_qabf),
+                    "val_vif": float(avg_vif),
                     "model": best_model_name,
                 })
-                lambda_json_path = os.path.join(model_path, f"{exp_id}-best-lambdas.json")
-                with open(lambda_json_path, "w") as f:
-                    json.dump(bin_w, f, indent=2)
-                torch.save(train_loss.state_dict(), os.path.join(model_path, f"{exp_id}-loss-best.pth"))
+                hparams_json_path = os.path.join(model_path, f"{exp_id}-best-hparams.json")
+                with open(hparams_json_path, "w") as f:
+                    json.dump(hparams, f, indent=2)
                 logger.info("Best model updated: {} (score: {:.4f} -> {:.4f})".format(
                     best_model_name, old_score, val_best_score))
-                logger.info(
-                    "Best-ckpt bin weights: halo=%s, bloom=%s, lambda_min=%.2f",
-                    bin_w["lambda_halo"], bin_w["lambda_bloom"], bin_w["lambda_min"],
-                )
                 patience = 0
             else:
                 patience += 1
@@ -569,36 +535,34 @@ def train(logger, exp_name=None, tb_root='./logs/tensorboard', tb_image_every=1,
                     break
     finally:
         writer.close()
-        bin_w = snapshot_bin_weights(train_loss)
+        hparams = snapshot_loss_hparams(train_loss)
         last_model_path = os.path.join(model_path, f"{exp_id}-last.pth")
         torch.save(train_model.state_dict(), last_model_path)
-        torch.save(train_loss.state_dict(), os.path.join(model_path, f"{exp_id}-loss-last.pth"))
-        with open(os.path.join(model_path, f"{exp_id}-last-lambdas.json"), "w") as f:
-            json.dump(bin_w, f, indent=2)
-        logger.info(
-            "Train end bin weights: halo=%s, bloom=%s, lambda_min=%.2f",
-            bin_w["lambda_halo"], bin_w["lambda_bloom"], bin_w["lambda_min"],
-        )
+        with open(os.path.join(model_path, f"{exp_id}-last-hparams.json"), "w") as f:
+            json.dump(hparams, f, indent=2)
         logger.info("Saved last-epoch model: %s", last_model_path)
 
 
 if __name__ == "__main__":
 
-    parser = argparse.ArgumentParser(description="Train fusion model. Defaults match the paper U-fuser run.")
-    parser.add_argument("--lambda_min", type=float, default=0.20,
-                        help="Lower bound for halo/washout bin weights. Paper default is 0.20.")
-    parser.add_argument("--backbone", type=str, default="ufuser", choices=["ufuser", "metafusion"],
-                        help="Paper main results use ufuser.")
-    parser.add_argument("--gpu", type=str, default="3")
+    parser = argparse.ArgumentParser(description="Train fusion with fixed halo/washout weights.")
+    parser.add_argument("--backbone", type=str, default="ufuser", choices=["ufuser", "metafusion"])
+    parser.add_argument("--gpu", type=str, default="0")
     parser.add_argument("--tag", type=str, default="",
-                        help="Optional run-name suffix. Auto-set when lambda_min != 0.20.")
+                        help="Optional run-name suffix. Auto-set from lambda_halo/bloom if empty.")
+    parser.add_argument("--lambda_halo", type=float, default=1.0,
+                        help="Fixed halo weight. Not learned. Paper default: 1.0")
+    parser.add_argument("--lambda_bloom", type=float, default=0.5,
+                        help="Fixed washout weight (--lambda_bloom is the historical flag name). Paper default: 0.5")
+    parser.add_argument("--q-bright", dest="q_bright", type=float, default=0.90,
+                        help="Intensity quantile for candidate halo/washout masks.")
     parser.add_argument(
         "--ufuser-call",
         dest="ufuser_call",
         type=str,
         default="named",
         choices=["named", "paper"],
-        help="named: model(IR, VIS_Y). paper: model(VIS_Y, IR), required to match 151334.",
+        help="named: model(IR, VIS_Y). paper: model(VIS_Y, IR).",
     )
     args = parser.parse_args()
 
@@ -610,16 +574,17 @@ if __name__ == "__main__":
     auto_tag = []
     if args.backbone != "ufuser":
         auto_tag.append(args.backbone)
-    if abs(args.lambda_min - 0.20) > 1e-8:
-        auto_tag.append(f"lmin{str(args.lambda_min).replace('.', 'p')}")
     if args.backbone == "ufuser" and args.ufuser_call == "paper":
         auto_tag.append("paper-call")
+    auto_tag.append(
+        f"h{str(args.lambda_halo).replace('.', 'p')}-w{str(args.lambda_bloom).replace('.', 'p')}"
+    )
+    if abs(args.q_bright - 0.90) > 1e-8:
+        auto_tag.append(f"q{str(args.q_bright).replace('.', 'p')}")
     if args.tag:
         run_id = f"{stamp}-{args.tag}"
-    elif auto_tag:
-        run_id = f"{stamp}-{'-'.join(auto_tag)}"
     else:
-        run_id = stamp
+        run_id = f"{stamp}-{'-'.join(auto_tag)}"
     logger = logging.getLogger()
     setup_logger(logpath, run_id=run_id)
     train(
@@ -627,9 +592,11 @@ if __name__ == "__main__":
         exp_name=run_id,
         tb_root=os.path.join(logpath, 'tensorboard'),
         tb_image_every=1,
-        lambda_min=args.lambda_min,
         backbone=args.backbone,
         ufuser_call=args.ufuser_call,
+        lambda_halo=args.lambda_halo,
+        lambda_bloom=args.lambda_bloom,
+        q_bright=args.q_bright,
     )
     logger.info("Train finish!")
 

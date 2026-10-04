@@ -1,54 +1,60 @@
-# Logs
+# Local machine config (dataset roots, etc.)
+.env
+local.env
+!.env.example
+
+# Logs and TensorBoard
 logs/
 *.log
 
-# Supplementary materials
+# Unpublished manuscript, exploratory figures, Overleaf assets
 supp/
 
-# Test images
+# User-provided datasets
+data/**
+!data/README.md
+!data/.gitkeep
 test_images/
 
-# Python cache
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
+.ipynb_checkpoints
 
-# Model checkpoints (usually large files)
+# Checkpoints (the released default weight is force-added; see README)
 *.pth
 *.pkl
 *.ckpt
 *.h5
 *.hdf5
+model/*-hparams.json
+model/*-lambdas.json
+!model/ours-best.pth
+!model/README.md
+!model/.gitkeep
 
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# Environment
-.env
+# Jupyter / env
 .venv
 env/
 venv/
 ENV/
-env.bak/
-venv.bak/
 
-# IDE
+# IDE / OS
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 .DS_Store
+.cursor/
 
-# Results
+# Fusion outputs and detection dumps
 results/
 outputs/
-
-# Temporary files
+fig/
+metric/
 *.tmp
 *.temp
 .cache/
-
-metric/
-
